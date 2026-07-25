@@ -4,8 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+---
+
+## [0.21.3] — 2026-07-25
+
+Patch: SPEC-089 / [#336](https://github.com/raphaelmansuy/edgequake/issues/336) — pool-safe health under large corpora; SPEC-088 list-surface delete hardening.
+
 ### Fixed
 
+- **#336** — Documents-list entity-count reconcile no longer runs corpus-wide `CROSS JOIN generate_series` before pagination; page-scoped reconcile + batched GIN probes + `SET LOCAL statement_timeout` (LAW-H2) stop zombie pool holders that starved `/health` task-queue stats.
+- **Sibling pool kills** — discovery (`scan_ops`), task `get_statistics`, native graph UI SQL, labels/BFS edges, INV-C, workspace AGE stats use `LocalTimeoutTx` / aligned PG budgets under app timeouts.
+- **Reprocess double-cascade** — admit path uses retract SSOT only (no second `cleanup_document_graph_data` discovery amp).
 - **Ghost documents after multi-delete** — completed MD/PDF rows reappeared on refresh after batch delete when KV metadata was wiped but `wsdoc:` index and/or SQL `documents` remained; list merge re-injected them as Completed.
 - **Batch `Ok(None)` orphan path** — already-absent KV no longer counts as success without purging list surfaces (SQL / wsdoc / content / hash).
 - **Cascade SQL delete** — relational row removal is fail-closed via scoped `delete_relational_document` (no warn-and-leave-ghosts).
@@ -13,6 +22,9 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **SPEC-089 health-check pack** — [`specs/089-health-check/`](specs/089-health-check/) (laws, sibling audit, e2e matrix).
+- **`LocalTimeoutTx`** — DRY transaction-scoped `SET LOCAL statement_timeout` helper in edgequake-storage.
+- **E2E / contracts** — `e2e_issue336_node_counts_bounded`, `e2e_spec089_list_page_reconcile`, `e2e_spec089_phase4`, `contract_spec089_*`.
 - **`purge_document_list_surfaces` SSOT** — single list-identity cleanup used by cascade completion, batch orphan, re-ingest wipe, and workspace wipe per-doc path.
 - **SPEC-088 data-layer pack** — inventory, complexity matrix, improvements RCA, version matrix workflow, dataop registry/tests under [`docs/data-layer/`](docs/data-layer/) and [`specs/088-data-layer/`](specs/088-data-layer/).
 - **Data-layer e2e / matrix tests** — `e2e_spec088_improvements`, ops matrix/registry/limits/scaling harness; CI workflow `data-layer-matrix.yml`.
@@ -24,7 +36,8 @@ All notable changes to this project will be documented in this file.
 
 ### Docs
 
-- Proven improvements and incident RCAs (cascade timeout + ghost list surfaces) in [`docs/data-layer/improvements.md`](docs/data-layer/improvements.md).
+- Proven improvements and incident RCAs (GH-336 pool exhaustion + cascade timeout + ghost list surfaces) in [`docs/data-layer/improvements.md`](docs/data-layer/improvements.md).
+- Local `make dev` Web UI default port documented as **http://localhost:3010** (Docker quickstart remains **:3000**).
 
 ---
 

@@ -5,7 +5,7 @@
 > **High-Performance Graph-RAG Framework in Rust**  
 > Transform documents into intelligent knowledge graphs for superior retrieval and generation
 
-[![Version](https://img.shields.io/badge/version-0.21.2-blue.svg?style=flat)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.21.3-blue.svg?style=flat)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rust-1.95+-orange.svg?style=flat&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat)](LICENSE)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg?style=flat)](https://github.com/raphaelmansuy/edgequake)
@@ -25,6 +25,8 @@ curl -fsSL https://raw.githubusercontent.com/raphaelmansuy/edgequake/edgequake-m
 
 The wizard guides you through provider selection (OpenAI / Ollama), model choice, and starts the full stack.  
 **Open** http://localhost:3000 **and you're in** — no login required (quickstart runs with open API via `EDGEQUAKE_DEV_MODE=true`).
+
+> **Ports:** Docker quickstart maps the Web UI to **http://localhost:3000**. Local `make dev` defaults to **http://localhost:3010** (avoids collisions with other stacks).
 
 <details>
 <summary><strong>Alternative: docker compose directly</strong></summary>
@@ -53,29 +55,28 @@ EDGEQUAKE_LLM_PROVIDER=ollama \
 
 </details>
 
-| Service | URL |
-|---------|-----|
-| Web UI | http://localhost:3000 |
-| REST API | http://localhost:8080 |
-| Swagger | http://localhost:8080/swagger-ui |
-| Health | http://localhost:8080/health |
+| Service | URL (Docker quickstart) | URL (`make dev`) |
+|---------|-------------------------|------------------|
+| Web UI | http://localhost:3000 | http://localhost:3010 |
+| REST API | http://localhost:8080 | http://localhost:8090* |
+| Swagger | http://localhost:8080/swagger-ui | http://localhost:8090/swagger-ui* |
+| Health | http://localhost:8080/health | http://localhost:8090/health* |
 
+\*Local `make dev` picks free ports starting at **8090** (API) / **3010** (UI); see `make status` for the bound ports.
 **Verify:**
 
 ```bash
 curl -s http://localhost:8080/health | python3 -m json.tool
 ```
 
-> Pin a version: `EDGEQUAKE_VERSION=0.21.2 sh quickstart.sh`
+> Pin a version: `EDGEQUAKE_VERSION=0.21.3 sh quickstart.sh`
 
-### What's new in 0.21.0
+### What's new in 0.21.3
 
-- **LightRAG query-API parity (074–085)** — Mix/local/global grounding and Acc honesty freeze vs LightRAG.
-- **D-30 `eq_rel_type` multigraph arbiter** — Native EDGE upserts + M092 readiness close the KG persist split-brain.
-- **SPEC-083 defect closure** — `/ready` AGE stub false positives, typed failure markers, schema/RLS/pipeline/query honesty.
+- **Pool-safe `/health` at scale (#336 / SPEC-089)** — page-scoped list reconcile + Postgres `SET LOCAL statement_timeout` so abandoned queries cannot exhaust the connection pool.
+- **Sibling hardening** — discovery, task stats, graph UI SQL, workspace stats, and reprocess admit (single cascade) share the same LAW-H2 timeout pattern.
 
-Also in **0.20.2**: opaque soft-labels (067/072/073), reliable delete + dual fairness lanes. **0.20.1**: durable wipe (#309), cascade (#305), Interrupted (#304). **0.20.0**: Smart Mix ([065](specs/001-benchmark/001-edgquake-improvements/065-smart-lightrag-mix-arms.md)), Drawing `display_name` ([066](specs/001-benchmark/001-edgquake-improvements/066-drawing-entity-display-name.md)).
-
+Also in **0.21.2**: dashboard stats N+1 (#334), shared guest identity (#335). **0.21.1**: SPEC-084 reliability (#331/#319/#317/#255/#318/#316). **0.21.0**: LightRAG query-API parity (074–085), D-30 `eq_rel_type`, SPEC-083 closure.
 ### Performance testing
 
 Publish Acc is **medical-mid n=200** (`make bench`) — not smoke n=40. Latest publish pack (`medical-mid-20260723T134124Z`): Acc EQ **0.770** vs LR **0.779** (Δ Acc 95% CI **[-0.045, +0.026]** — **statistical tie**; do **not** claim EQ beats LightRAG). Fair cold latency ratio **1.02×** (`C1COLD_v1`). Smoke peers remain CI/ablation references only.
@@ -110,7 +111,7 @@ export NEXT_PUBLIC_DISABLE_DEMO_LOGIN=true
 docker compose -f docker-compose.quickstart.yml up -d
 ```
 
-The API creates the bootstrap admin on startup. Sign in at http://localhost:3000/login.
+The API creates the bootstrap admin on startup. Sign in at http://localhost:3000/login (Docker quickstart) or http://localhost:3010/login (`make dev`).
 
 Upgrades from pre-v0.15: legacy KV `auth:user:*` records are imported into PostgreSQL automatically when present.
 
@@ -131,7 +132,7 @@ curl -X POST http://localhost:8080/api/v1/documents/upload \
   -F "file=@your-document.pdf"
 ```
 
-Or drag-and-drop in the Web UI at http://localhost:3000.
+Or drag-and-drop in the Web UI at http://localhost:3000 (Docker) or http://localhost:3010 (`make dev`).
 
 **Query the knowledge graph:**
 
@@ -291,10 +292,10 @@ docker compose -f docker-compose.prebuilt.yml up -d
 
 ```bash
 # Pin full stack to this release
-EDGEQUAKE_VERSION=0.21.2 docker compose -f docker-compose.quickstart.yml up -d
+EDGEQUAKE_VERSION=0.21.3 docker compose -f docker-compose.quickstart.yml up -d
 
 # Pin PostgreSQL major (optional; default tag follows EDGEQUAKE_VERSION → PG18)
-EDGEQUAKE_VERSION=0.21.2 EDGEQUAKE_POSTGRES_TAG=0.21.0-pg16 \
+EDGEQUAKE_VERSION=0.21.3 EDGEQUAKE_POSTGRES_TAG=0.21.0-pg16 \
   docker compose -f docker-compose.quickstart.yml up -d
 ```
 
@@ -373,6 +374,7 @@ git clone https://github.com/raphaelmansuy/edgequake.git && cd edgequake
 make install
 cp edgequake_webui/.env.local.example edgequake_webui/.env.local
 make dev                        # Start full stack (PostgreSQL + Backend + Frontend)
+# Web UI defaults to http://localhost:3010 — confirm with: make status
 ```
 
 ```bash

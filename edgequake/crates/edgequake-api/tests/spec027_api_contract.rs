@@ -305,7 +305,13 @@ fn spec027_traversal_pushes_tenant_scope_to_storage() {
             .join("../edgequake-storage/src/adapters/postgres/graph/query_ops/expand.rs"),
     )
     .unwrap_or_else(|e| panic!("read query_ops/expand.rs: {e}"));
-    assert!(query_ops.contains("pg_get_knowledge_graph_scoped"));
+    // Storage entry is `pg_get_knowledge_graph` (tenant/workspace args — not a separate *_scoped name).
+    assert!(query_ops.contains("pg_get_knowledge_graph("));
+    assert!(
+        query_ops.contains("tenant_id: Option<&str>")
+            && query_ops.contains("workspace_id: Option<&str>"),
+        "pg_get_knowledge_graph must accept tenant/workspace scope"
+    );
 }
 
 #[test]
