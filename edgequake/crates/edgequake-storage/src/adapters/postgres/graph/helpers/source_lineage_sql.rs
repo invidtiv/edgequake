@@ -4,6 +4,12 @@
 //! Two-path design (issue #305/#309):
 //! - **Modern**: GIN-friendly `source_ids @>` exact candidates (indexed).
 //! - **Legacy**: bounded LIKE/unnest only when modern arrays are absent.
+//!
+//! # SPEC-089 / GH-336
+//!
+//! Cartesian `prefixes × SOURCE_CHUNK_PROBE_LIMIT` probes are safe only for
+//! **page-scoped** batches. Always combine with [`SOURCE_PREFIX_BATCH_LIMIT`]
+//! and [`SOURCE_COUNT_STATEMENT_TIMEOUT_MS`] (LAW-H1 / LAW-H2).
 
 /// Max chunk indices probed for GIN `@>` entity-count reconcile (list hot path).
 ///
@@ -11,8 +17,50 @@
 /// `_ag_label_vertex` (~140k+ nodes → multi-second Documents list). Exact
 /// chunk-id containment uses `idx_*_source_ids_gin` (~1 ms). Documents with
 /// more than this many chunks still get a correct lower bound; stats write
-/// path (P-A1) remains the primary count source.
+/// path (P-A1) remains the primary count source (LAW-H5).
 pub(in crate::adapters::postgres::graph) const SOURCE_CHUNK_PROBE_LIMIT: usize = 256;
+
+/// Max document prefixes per count SQL round-trip (SPEC-089 / GH-336 / LAW-H1).
+///
+/// WHY: one query with thousands of prefixes × 256 probes saturates the pool
+/// even when each GIN probe is cheap (~7ms). Callers chunk larger lists.
+pub(in crate::adapters::postgres::graph) const SOURCE_PREFIX_BATCH_LIMIT: usize = 32;
+
+/// Server-side kill for entity-count reconcile (SPEC-089 / GH-336 / LAW-H2).
+///
+/// WHY: `tokio::time::timeout` alone abandons the Rust future while Postgres
+/// keeps running (zombie pool holders). `SET LOCAL statement_timeout` inside
+/// a transaction cancels the statement; aligned under API `AGE_RECONCILE_TIMEOUT`
+/// (400ms).
+pub(in crate::adapters::postgres::graph) const SOURCE_COUNT_STATEMENT_TIMEOUT_MS: u32 = 300;
+
+/// Server-side kill for cascade discovery GIN probes (SPEC-089 Wave 3 / F-336-08).
+///
+/// WHY: delete/reprocess use the same `CROSS JOIN generate_series` CTE as counts
+/// but need a larger budget than list reconcile (typical ~100ms; concurrent
+/// storms must still die ≪ minutes).
+pub(in crate::adapters::postgres::graph) const SOURCE_DISCOVERY_STATEMENT_TIMEOUT_MS: u32 = 2000;
+
+/// Server-side kill for workspace dashboard AGE counts (SPEC-089 Phase 4 / F-336-14).
+///
+/// WHY: `GET /workspaces/{id}/stats` wraps fetch in `tokio::timeout(4s)`. PG must
+/// cancel first (LAW-H2) — 250ms headroom under the app budget.
+pub(in crate::adapters::postgres::graph) const WORKSPACE_STATS_STATEMENT_TIMEOUT_MS: u32 = 3_750;
+
+/// Resolve probe series upper bound from known chunk counts (SPEC-089).
+///
+/// `0` / unknown → full [`SOURCE_CHUNK_PROBE_LIMIT`]. Otherwise
+/// `clamp(max_chunk_count, 1..=SOURCE_CHUNK_PROBE_LIMIT)` so
+/// `generate_series(0, n-1)` covers chunk indices `0..chunk_count-1`.
+pub(in crate::adapters::postgres::graph) fn source_count_probe_limit(
+    max_chunk_count: usize,
+) -> usize {
+    if max_chunk_count == 0 {
+        SOURCE_CHUNK_PROBE_LIMIT
+    } else {
+        max_chunk_count.clamp(1, SOURCE_CHUNK_PROBE_LIMIT)
+    }
+}
 
 use super::escape::escape_sql_literal;
 
@@ -227,5 +275,28 @@ mod tests {
         let c = source_ids_count_probes_cte_sql();
         assert!(c.contains("prefixes AS MATERIALIZED"));
         assert!(c.contains("probes AS MATERIALIZED"));
+    }
+
+    #[test]
+    fn spec089_batch_and_timeout_constants() {
+        assert_eq!(SOURCE_PREFIX_BATCH_LIMIT, 32);
+        assert_eq!(SOURCE_COUNT_STATEMENT_TIMEOUT_MS, 300);
+        assert_eq!(SOURCE_DISCOVERY_STATEMENT_TIMEOUT_MS, 2000);
+        assert_eq!(WORKSPACE_STATS_STATEMENT_TIMEOUT_MS, 3_750);
+        const {
+            assert!(WORKSPACE_STATS_STATEMENT_TIMEOUT_MS < 4_000);
+        }
+        assert_eq!(SOURCE_CHUNK_PROBE_LIMIT, 256);
+    }
+
+    #[test]
+    fn spec089_probe_limit_from_chunk_count() {
+        assert_eq!(source_count_probe_limit(0), SOURCE_CHUNK_PROBE_LIMIT);
+        assert_eq!(source_count_probe_limit(5), 5);
+        assert_eq!(source_count_probe_limit(1), 1);
+        assert_eq!(
+            source_count_probe_limit(SOURCE_CHUNK_PROBE_LIMIT + 50),
+            SOURCE_CHUNK_PROBE_LIMIT
+        );
     }
 }

@@ -82,11 +82,27 @@ pub trait GraphStorageAnalyticsOps: GraphStorageReadOps + GraphScanOps {
     /// Missing keys mean count 0.
     ///
     /// Default: one `find_nodes_by_source_prefixes` scan + in-memory bucketing.
-    /// Postgres AGE overrides with a single GIN `@>` SQL query (no materialize).
+    /// Postgres AGE overrides with a GIN `@>` SQL query (batched; SPEC-089).
     async fn node_counts_by_source_prefixes(
         &self,
         prefixes: &[String],
     ) -> Result<HashMap<String, usize>> {
+        self.node_counts_by_source_prefixes_capped(prefixes, 256)
+            .await
+    }
+
+    /// Like [`node_counts_by_source_prefixes`] with an explicit chunk-index
+    /// probe upper bound (SPEC-089 / GH-336 / LAW-H1).
+    ///
+    /// `probe_limit` is clamped by adapters to the SSOT max (256). Prefer
+    /// `max(chunk_count)` on the visible page so probes stay `≤ page × chunks`
+    /// instead of `corpus × 256`.
+    async fn node_counts_by_source_prefixes_capped(
+        &self,
+        prefixes: &[String],
+        probe_limit: usize,
+    ) -> Result<HashMap<String, usize>> {
+        let _ = probe_limit;
         use super::graph_scan_ops::{collect_source_references, NodeListFilter};
         let mut out = HashMap::with_capacity(prefixes.len());
         if prefixes.is_empty() {

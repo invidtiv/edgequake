@@ -406,12 +406,10 @@ async fn list_documents_inner(
         }
     }
 
-    if should_skip_entity_reconcile(&tasks.storage).await {
-        // Serve KV/relational counts under queue/storage pressure — never hang on AGE.
-    } else {
-        crate::document_read_model::reconcile_entity_counts_with_graph(&storage, &mut documents)
-            .await;
-    }
+    // SPEC-089 / GH-336 / LAW-H1: do NOT reconcile entity counts here.
+    // Pre-pagination reconcile built prefixes×256 GIN probes over the full corpus
+    // and exhausted the pool (health/task claim collateral). Heal runs after
+    // paginate_vec on the visible page only.
 
     // SPEC-005: Apply optional date range and title pattern filters
     if params.date_from.is_some() || params.date_to.is_some() || params.document_pattern.is_some() {
@@ -594,7 +592,16 @@ async fn list_documents_inner(
     // SPEC-027 IMP-020: honor query pagination (status_counts remain over full pre-status set).
     let page_size = budget.clamp_page_size(params.page_size.min(u32::MAX as usize) as u32) as usize;
     let page = params.page.max(1);
-    let (documents, pagination) = paginate_vec(documents, page, page_size);
+    let (mut documents, pagination) = paginate_vec(documents, page, page_size);
+
+    // SPEC-089 / GH-336 / LAW-H1: AGE entity_count heal for the returned page only.
+    // Status counts / total already computed over the full filtered set above.
+    if should_skip_entity_reconcile(&tasks.storage).await {
+        // Serve KV/relational counts under queue/storage pressure — never hang on AGE.
+    } else {
+        crate::document_read_model::reconcile_entity_counts_with_graph(&storage, &mut documents)
+            .await;
+    }
 
     Ok(Json(ListDocumentsResponse {
         total: pagination.total,

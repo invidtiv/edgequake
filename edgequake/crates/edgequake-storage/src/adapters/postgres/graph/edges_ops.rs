@@ -445,6 +445,31 @@ impl PostgresAGEGraphStorage {
         const CHUNK: usize = 200;
         let mut all_edges = Vec::new();
 
+        // SPEC-083 / X-03: COALESCE(eq_*, props) when columns exist; prop-only otherwise.
+        let eq_present = self.eq_columns_present(&mut conn).await?;
+        let src = if eq_present {
+            super::helpers::coalesce_endpoint("e", "source")
+        } else {
+            super::helpers::prop_only_endpoint("e", "source")
+        };
+        let tgt = if eq_present {
+            super::helpers::coalesce_endpoint("e", "target")
+        } else {
+            super::helpers::prop_only_endpoint("e", "target")
+        };
+        if !eq_present || super::helpers::eq_id_fallback_env_enabled() {
+            tracing::debug!(
+                target: "edgequake_storage",
+                eq_present,
+                "eq_id_fallback_used: pg_get_incident_edges_batch"
+            );
+        }
+
+        // SPEC-089 / F-336-15 / LAW-H2: BFS expand under run_timed_graph_query —
+        // PG must cancel before tokio abandons (zombie pool).
+        let timeout_ms = super::helpers::graph_query_statement_timeout_ms();
+        let mut timed = super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+
         for chunk in unique.chunks(CHUNK) {
             let in_list: String = chunk
                 .iter()
@@ -461,25 +486,6 @@ impl PostgresAGEGraphStorage {
             //   deduplicates via equality) raises "could not identify an equality
             //   operator for type json". OR evaluates as a BitmapOr of two index
             //   scans without ever comparing the json column values.
-            // SPEC-083 / X-03: COALESCE(eq_*, props) when columns exist; prop-only otherwise.
-            let eq_present = self.eq_columns_present(&mut conn).await?;
-            let src = if eq_present {
-                super::helpers::coalesce_endpoint("e", "source")
-            } else {
-                super::helpers::prop_only_endpoint("e", "source")
-            };
-            let tgt = if eq_present {
-                super::helpers::coalesce_endpoint("e", "target")
-            } else {
-                super::helpers::prop_only_endpoint("e", "target")
-            };
-            if !eq_present || super::helpers::eq_id_fallback_env_enabled() {
-                tracing::debug!(
-                    target: "edgequake_storage",
-                    eq_present,
-                    "eq_id_fallback_used: pg_get_incident_edges_batch"
-                );
-            }
             let sql = format!(
                 "SELECT ag_catalog.agtype_to_json(e.properties) AS props \
                  FROM {graph}.\"EDGE\" e \
@@ -492,13 +498,21 @@ impl PostgresAGEGraphStorage {
                 tgt = tgt,
             );
 
-            let rows = sqlx::query(&sql).fetch_all(&mut *conn).await.map_err(|e| {
-                StorageError::Database(format!("Batch incident edges query failed: {}", e))
-            })?;
+            let rows = match sqlx::query(&sql).fetch_all(&mut **timed.as_mut()).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = timed.rollback().await;
+                    return Err(StorageError::Database(format!(
+                        "Batch incident edges query failed: {}",
+                        e
+                    )));
+                }
+            };
 
             all_edges.extend(Self::edges_from_props_rows(&rows));
         }
 
+        timed.commit().await?;
         Ok(all_edges)
     }
 

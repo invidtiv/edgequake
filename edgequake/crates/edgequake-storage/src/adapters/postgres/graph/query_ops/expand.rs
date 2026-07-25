@@ -250,9 +250,21 @@ impl PostgresAGEGraphStorage {
             .await
             .map_err(|e| StorageError::Database(format!("Failed to set search_path: {}", e)))?;
 
-        let rows = sqlx::query(&sql).fetch_all(&mut *conn).await.map_err(|e| {
-            StorageError::Database(format!("get_edges_for_node_set SQL failed: {}", e))
-        })?;
+        // SPEC-089 Wave 3 / F-336-10: PG kill aligned with run_timed_graph_query.
+        let timeout_ms = super::super::helpers::graph_query_statement_timeout_ms();
+        let mut timed = super::super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let rows = match sqlx::query(&sql).fetch_all(&mut **timed.as_mut()).await {
+            Ok(r) => {
+                timed.commit().await?;
+                r
+            }
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "get_edges_for_node_set SQL failed: {e}"
+                )));
+            }
+        };
 
         let edges: Vec<GraphEdge> = rows
             .iter()

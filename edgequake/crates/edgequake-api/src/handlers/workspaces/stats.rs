@@ -81,6 +81,8 @@ pub async fn get_workspace_stats(
         cache.get(&workspace_id).map(|c| c.stats.clone())
     };
 
+    // SPEC-089 Phase 4 / F-336-14 / LAW-H2: app 4s; AGE counts use
+    // WORKSPACE_STATS_STATEMENT_TIMEOUT_MS=3750 so Postgres cancels first.
     const STATS_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
     let fetch_result = tokio::time::timeout(

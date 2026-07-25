@@ -188,13 +188,14 @@ pub use adapters::postgres::{
     build_diskann_labels_index_sql, build_filtered_diskann_label_select_sql,
     build_postfilter_diskann_select_sql, diskann_optin_recipe_statements,
     diskann_query_tuning_statements, diskann_rescore_for_list, hnsw_ef_construction_from_env,
-    hnsw_partial_by_workspace_enabled, parse_hnsw_iterative_scan_mode, AnnExactReorderPolicy,
-    BinaryQuantizePolicy, FilteredDiskannLabelPolicy, HnswRuntimePolicy, PgVectorStorage,
-    PgWorkspaceVectorRegistry, PostgresAGEGraphStorage, PostgresConfig,
-    PostgresConversationStorage, PostgresKVStorage, PostgresMmAssetStorage,
-    PostgresOriginalStorage, PostgresPdfStorage, PostgresPool, VectorIndexType, VectorStorageMode,
-    WorkspaceLabelMap, DEFAULT_ANN_REORDER_CANDIDATE_K, DEFAULT_BINARY_CANDIDATE_K,
-    DISKANN_OPTIN_RESCORE, DISKANN_OPTIN_SEARCH_LIST, MAX_WORKSPACE_LABELS,
+    hnsw_partial_by_workspace_enabled, interactive_statement_timeout_ms,
+    parse_hnsw_iterative_scan_mode, AnnExactReorderPolicy, BinaryQuantizePolicy,
+    FilteredDiskannLabelPolicy, HnswRuntimePolicy, PgVectorStorage, PgWorkspaceVectorRegistry,
+    PostgresAGEGraphStorage, PostgresConfig, PostgresConversationStorage, PostgresKVStorage,
+    PostgresMmAssetStorage, PostgresOriginalStorage, PostgresPdfStorage, PostgresPool,
+    VectorIndexType, VectorStorageMode, WorkspaceLabelMap, DEFAULT_ANN_REORDER_CANDIDATE_K,
+    DEFAULT_BINARY_CANDIDATE_K, DISKANN_OPTIN_RESCORE, DISKANN_OPTIN_SEARCH_LIST,
+    LAST_SOURCE_PREFIX_COUNT_LEN, MAX_WORKSPACE_LABELS, SOURCE_PREFIX_DISCOVERY_CALLS,
 };
 
 // Re-export KV key schema for use across all crates

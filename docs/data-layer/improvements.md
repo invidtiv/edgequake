@@ -42,6 +42,38 @@ Sources (July 2026):
 | **Delete final-first** | Promoted final wins when both keys exist | **Done** — IMP-075-13 (distinct from ingest SSOT) |
 | **Probe-first GIN** | Never tenant-scan then Join-Filter `@>` | **Done** — IMP-031-08 (cascade timeout RCA) |
 | **List-surface completeness** | Delete success ⇒ no row on merge(KV, SQL, wsdoc) | **Done** — `purge_document_list_surfaces` SSOT |
+| **App timeout ≠ kill** | `tokio::timeout` without `SET LOCAL statement_timeout` is a zombie pool factory (LAW-H2) | **Done** — SPEC-089 / GH-336 Wave 1–3 |
+
+---
+
+## Incident RCA — GH-336 health / pool exhaustion (2026-07-25)
+
+### Symptom
+
+At ~9.5k documents, `/health` “task queue statistics” timed out; pool (`DATABASE_POOL_SIZE=15`) saturated; claim/checkpoint failed with acquire timeout.
+
+### Root cause (code is law)
+
+| Step | What happened |
+|---|---|
+| 1 | Documents list ran P-A3 `node_counts_by_source_prefixes` on **all** zero-count docs **before** pagination |
+| 2 | SQL: `CROSS JOIN generate_series(0,255)` → `N × 256` GIN probes (~2.4M at 9.5k docs) |
+| 3 | Rust `timeout(400ms)` abandoned the future; Postgres kept running (no `statement_timeout`) |
+| 4 | Concurrent pollers stacked zombies → `/health` cheap `get_statistics` starved |
+
+GH-331 had already fixed JOIN locality (`"Node"` + GIN). GH-336 is **query shape + cancel**, not index locality.
+
+### AFTER (SPEC-089)
+
+| Layer | Fix |
+|---|---|
+| List | Reconcile **after** `paginate_vec` (page only) — LAW-H1 |
+| Count SQL | Batch ≤32 + `SET LOCAL statement_timeout=300ms` — LAW-H2 |
+| Probe bound | From page `chunk_count` when known |
+| Wave 3 | `LocalTimeoutTx` on discovery / task stats / native graph / labels / BFS edges / INV-C; app timeout > PG kill |
+| Phase 4 | Reprocess single cascade; workspace stats 3750ms PG kill; interactive budget helper |
+
+**SSOT:** [`specs/089-health-check/`](../../specs/089-health-check/) · tests `e2e_issue336_*` · `contract_spec089_*`
 
 ---
 

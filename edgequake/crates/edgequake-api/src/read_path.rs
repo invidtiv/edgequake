@@ -15,6 +15,12 @@ use tracing::{info, warn};
 use crate::error::{ApiError, ApiResult};
 
 /// Default document read deadline (ms) when env is unset.
+///
+/// SPEC-089 Phase 4 / F-336-13 / LAW-H2: any SQL under this envelope must use
+/// a Postgres kill **strictly under** this budget (storage
+/// `interactive_statement_timeout_ms` = budget − 250ms). Worker task wall-clock
+/// (≤7200s) is LLM-bound — per-statement kills stay on `LocalTimeoutTx` / AGE
+/// session GUCs, not this interactive budget.
 pub const DEFAULT_DOCUMENTS_READ_TIMEOUT_MS: u64 = 2_500;
 
 /// Cap on workspace KV metadata entries scanned before pagination.
@@ -81,6 +87,23 @@ pub fn documents_read_timeout() -> Duration {
     Duration::from_millis(ms)
 }
 
+/// Postgres kill budget for SQL under [`run_with_read_path_guard`] (LAW-H2).
+///
+/// Strictly less than [`documents_read_timeout`] so abandoned futures cannot
+/// leave zombie pool holders (SPEC-089 Phase 4 / F-336-13).
+#[cfg(feature = "postgres")]
+pub fn documents_read_pg_timeout_ms() -> u32 {
+    edgequake_storage::interactive_statement_timeout_ms()
+}
+
+#[cfg(not(feature = "postgres"))]
+pub fn documents_read_pg_timeout_ms() -> u32 {
+    documents_read_timeout()
+        .as_millis()
+        .saturating_sub(250)
+        .max(1) as u32
+}
+
 /// Remaining budget until `deadline` (zero if already elapsed).
 fn remaining_until(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
@@ -124,6 +147,12 @@ where
     }
 }
 
+/// App wait for task stats before list reconcile.
+///
+/// LAW-H2: must be **greater** than tasks `STATS_STATEMENT_TIMEOUT_MS` (500)
+/// so Postgres cancels the COUNT before tokio abandons the future (zombie pool).
+const ENTITY_RECONCILE_STATS_APP_TIMEOUT_MS: u64 = 550;
+
 /// Whether list should skip AGE entity-count reconcile (queue critical / stats hang).
 pub async fn should_skip_entity_reconcile(
     task_storage: &edgequake_tasks::SharedTaskStorage,
@@ -131,7 +160,7 @@ pub async fn should_skip_entity_reconcile(
     use crate::task_queue_pressure::health_degraded_by_queue;
 
     match tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_millis(ENTITY_RECONCILE_STATS_APP_TIMEOUT_MS),
         task_storage.get_statistics(edgequake_tasks::storage::TaskFilter::default()),
     )
     .await
@@ -184,6 +213,18 @@ mod tests {
         assert_eq!(ReadPathDbPermit::from_pool_size(8).max_concurrent(), 2);
         assert_eq!(ReadPathDbPermit::from_pool_size(32).max_concurrent(), 4);
         assert_eq!(ReadPathDbPermit::from_pool_size(64).max_concurrent(), 8);
+    }
+
+    #[test]
+    fn documents_read_pg_timeout_under_app_budget() {
+        let prev = std::env::var("EDGEQUAKE_DOCUMENTS_READ_TIMEOUT_MS").ok();
+        std::env::remove_var("EDGEQUAKE_DOCUMENTS_READ_TIMEOUT_MS");
+        let app_ms = documents_read_timeout().as_millis() as u32;
+        let pg_ms = documents_read_pg_timeout_ms();
+        assert!(pg_ms < app_ms, "LAW-H2: pg={pg_ms} must be < app={app_ms}");
+        if let Some(v) = prev {
+            std::env::set_var("EDGEQUAKE_DOCUMENTS_READ_TIMEOUT_MS", v);
+        }
     }
 
     #[tokio::test]

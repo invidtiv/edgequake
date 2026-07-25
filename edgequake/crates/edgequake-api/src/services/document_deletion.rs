@@ -176,7 +176,10 @@ pub async fn purge_document_list_surfaces(
     }
     if let Some(content_hash) = opts.content_hash {
         if !content_hash.is_empty() {
-            keys.push(ContentHasher::workspace_hash_key(workspace_id, content_hash));
+            keys.push(ContentHasher::workspace_hash_key(
+                workspace_id,
+                content_hash,
+            ));
             keys.push(kv_keys::staging_workspace_hash(workspace_id, content_hash));
         }
     }
@@ -1039,15 +1042,13 @@ mod tests {
                 .is_none(),
             "wsdoc index must be purged (ghost list source)"
         );
-        assert!(
-            state
-                .storage
-                .kv_storage
-                .get_by_id(&content_key)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(state
+            .storage
+            .kv_storage
+            .get_by_id(&content_key)
+            .await
+            .unwrap()
+            .is_none());
         assert!(
             state
                 .storage
@@ -1087,10 +1088,7 @@ mod tests {
             .storage
             .kv_storage
             .upsert(&[
-                (
-                    wsdoc_id.clone(),
-                    serde_json::json!({"document_id": doc_id}),
-                ),
+                (wsdoc_id.clone(), serde_json::json!({"document_id": doc_id})),
                 (
                     wsdoc_prefix.clone(),
                     serde_json::json!({"document_id": key_prefix}),

@@ -823,7 +823,7 @@ impl StorageInspector {
     /// was never refreshed (file 16 §3), so the invariant would fire on every
     /// document. The authoritative per-doc entity count is the AGE graph;
     /// this invariant samples documents and compares their relational
-    /// `entity_count` against a Cypher count keyed by the chunk-id prefix,
+    /// `entity_count` against AGE GIN `@>` counts (SPEC-089 Wave 3 / F-336-11),
     /// flagging CRITICAL drift so the admin endpoint (P-D2) can surface it.
     ///
     /// Skips docs in `processing`/`pending` state (mid-ingestion, E16) and
@@ -864,38 +864,42 @@ impl StorageInspector {
         }
         let total = rows.len();
 
+        // SPEC-089 / LAW-H4: one batched GIN probe query (same shape as
+        // analytics_ops) instead of 50× Cypher STARTS WITH SeqScans.
+        let prefixes: Vec<String> = rows
+            .iter()
+            .map(|(doc_id, _, _)| format!("{doc_id}-chunk-"))
+            .collect();
+        let max_chunks = rows
+            .iter()
+            .map(|(_, c, _)| (*c).max(0) as usize)
+            .max()
+            .unwrap_or(0);
+        let probe_limit = if max_chunks == 0 {
+            256
+        } else {
+            max_chunks.clamp(1, 256)
+        };
+
+        let age_counts = match self
+            .inv_c_gin_node_counts_by_prefixes(&prefixes, probe_limit)
+            .await
+        {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = %e, "INV-C: batched GIN entity count failed — skipping");
+                return;
+            }
+        };
+
         let mut drifted = 0usize;
         let mut samples = Vec::new();
-        for (doc_id, _chunk_count, pg_entity_count) in rows {
-            // Direct Cypher via the AGE vertex table: count nodes whose
-            // source_ids array (or legacy source_id) starts with the doc's
-            // chunk prefix. Mirrors `pg_node_count_by_source_prefix`.
-            let prefix = format!("{}-chunk-", doc_id);
-            let escaped = prefix.replace('\'', "''");
-            let cypher = format!(
-                "MATCH (n:Node) WHERE \
-                    (n.source_ids IS NOT NULL AND \
-                     any(s IN n.source_ids WHERE s STARTS WITH '{}')) \
-                    OR (n.source_id IS NOT NULL AND n.source_id STARTS WITH '{}') \
-                 RETURN count(n)",
-                escaped, escaped
-            );
-            let age_sql = format!(
-                "SELECT * FROM cypher('{}', $$ {} $$) AS (result agtype)",
-                self.config.graph_name, cypher
-            );
-            // AGE returns agtype; coerce to text then parse.
-            let age_count: i64 = match sqlx::query_scalar::<_, String>(&age_sql)
-                .fetch_one(self.pool.as_ref())
-                .await
-                .ok()
-                .and_then(|s| s.trim_matches('"').parse::<i64>().ok())
-            {
-                Some(n) => n,
-                None => continue, // AGE query hiccup — skip, do not false-positive (E8)
+        for (doc_id, _chunk_count, pg_entity_count) in &rows {
+            let prefix = format!("{doc_id}-chunk-");
+            let Some(age_count) = age_counts.get(&prefix).copied() else {
+                continue; // hiccup — skip, do not false-positive (E8)
             };
-
-            if age_count as i32 != pg_entity_count {
+            if age_count as i32 != *pg_entity_count {
                 drifted += 1;
                 if samples.len() < 5 {
                     samples.push(format!("{doc_id}: pg={pg_entity_count} age={age_count}"));
@@ -921,6 +925,81 @@ impl StorageInspector {
                 sample_ids: samples,
             });
         }
+    }
+
+    /// Batched GIN `@>` entity counts for INV-C (mirrors analytics_ops / SPEC-089).
+    async fn inv_c_gin_node_counts_by_prefixes(
+        &self,
+        prefixes: &[String],
+        probe_limit: usize,
+    ) -> Result<std::collections::HashMap<String, i64>, String> {
+        use sqlx::Acquire;
+        use std::collections::HashMap;
+
+        if prefixes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        const TIMEOUT_MS: u32 = 300;
+        let graph = &self.config.graph_name;
+        let sql = format!(
+            r#"
+            WITH prefixes AS MATERIALIZED (
+              SELECT prefix, ord
+              FROM unnest($1::text[]) WITH ORDINALITY AS t(prefix, ord)
+            ),
+            probes AS MATERIALIZED (
+              SELECT p.prefix, p.ord, (p.prefix || gs.i::text) AS chunk_id
+              FROM prefixes p
+              CROSS JOIN generate_series(0, $2::int - 1) AS gs(i)
+            ),
+            hits AS MATERIALIZED (
+              SELECT pr.prefix, pr.ord, v.id
+              FROM probes pr
+              INNER JOIN {graph}."Node" v
+                ON ((ag_catalog.agtype_to_json(v.properties))::jsonb -> 'source_ids')
+                   @> to_jsonb(pr.chunk_id)
+            )
+            SELECT p.prefix, count(DISTINCT h.id)::BIGINT AS cnt
+            FROM prefixes p
+            LEFT JOIN hits h ON h.prefix = p.prefix
+            GROUP BY p.prefix, p.ord
+            ORDER BY p.ord
+            "#
+        );
+
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| format!("INV-C acquire: {e}"))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| format!("INV-C begin: {e}"))?;
+        sqlx::query(&format!("SET LOCAL statement_timeout = '{TIMEOUT_MS}ms'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| format!("INV-C statement_timeout: {e}"))?;
+
+        let rows: Vec<(String, i64)> = match sqlx::query_as(&sql)
+            .bind(prefixes)
+            .bind(probe_limit as i32)
+            .fetch_all(&mut *tx)
+            .await
+        {
+            Ok(r) => {
+                tx.commit()
+                    .await
+                    .map_err(|e| format!("INV-C commit: {e}"))?;
+                r
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(format!("INV-C GIN count failed: {e}"));
+            }
+        };
+
+        Ok(rows.into_iter().collect())
     }
 
     /// INV-04b (SPEC-021 P-D3): silent CQRS no-op detection.

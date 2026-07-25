@@ -9,7 +9,7 @@ use crate::{
 #[cfg(feature = "postgres")]
 use chrono::Utc;
 #[cfg(feature = "postgres")]
-use sqlx::{postgres::PgRow, PgPool, Row};
+use sqlx::{postgres::PgRow, Acquire, PgPool, Row};
 #[cfg(feature = "postgres")]
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
@@ -351,7 +351,13 @@ impl TaskStorage for PostgresTaskStorage {
 
     async fn get_statistics(&self, filter: TaskFilter) -> TaskResult<TaskStatistics> {
         // WHY: Build dynamic SQL to support tenant/workspace filtering
-        // Without this, statistics would leak across tenant boundaries
+        // Without this, statistics would leak across tenant boundaries.
+        //
+        // SPEC-089 Wave 3 / F-336-09 / LAW-H2: health & list skip wrap this in
+        // tokio::timeout (750ms / 550ms). SET LOCAL 500ms kills COUNTs before
+        // the app abandons so they cannot zombie the shared pool (GH-336 class).
+        const STATS_STATEMENT_TIMEOUT_MS: u32 = 500;
+
         let mut query = String::from(
             r#"
             SELECT
@@ -392,6 +398,22 @@ impl TaskStorage for PostgresTaskStorage {
             query.push_str(&format!(" AND task_type = ${}", param_count));
         }
 
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            TaskError::StorageError(format!("Failed to acquire connection for statistics: {e}"))
+        })?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| TaskError::StorageError(format!("Failed to begin statistics txn: {e}")))?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{STATS_STATEMENT_TIMEOUT_MS}ms'"
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TaskError::StorageError(format!("Failed to set statistics statement_timeout: {e}"))
+        })?;
+
         // Build and bind query
         let mut sqlx_query = sqlx::query(&query);
 
@@ -411,10 +433,20 @@ impl TaskStorage for PostgresTaskStorage {
             sqlx_query = sqlx_query.bind(task_type.to_string());
         }
 
-        let row = sqlx_query
-            .fetch_one(&*self.pool)
-            .await
-            .map_err(|e| TaskError::StorageError(format!("Failed to get statistics: {}", e)))?;
+        let row = match sqlx_query.fetch_one(&mut *tx).await {
+            Ok(row) => {
+                tx.commit().await.map_err(|e| {
+                    TaskError::StorageError(format!("Failed to commit statistics txn: {e}"))
+                })?;
+                row
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(TaskError::StorageError(format!(
+                    "Failed to get statistics: {e}"
+                )));
+            }
+        };
 
         Ok(TaskStatistics {
             pending: row.get::<i64, _>("pending") as u64,

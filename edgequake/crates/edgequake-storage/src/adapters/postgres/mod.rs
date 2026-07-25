@@ -80,7 +80,10 @@ pub use filtered_diskann_label_policy::{
     build_filtered_diskann_label_select_sql, build_postfilter_diskann_select_sql,
     FilteredDiskannLabelPolicy, WorkspaceLabelMap, MAX_WORKSPACE_LABELS,
 };
-pub use graph::PostgresAGEGraphStorage;
+pub use graph::{
+    interactive_statement_timeout_ms, PostgresAGEGraphStorage, LAST_SOURCE_PREFIX_COUNT_LEN,
+    SOURCE_PREFIX_DISCOVERY_CALLS,
+};
 pub use hnsw_runtime_policy::{
     filtered_ann_gucs_satisfy_contract, hnsw_partial_by_workspace_enabled,
     parse_hnsw_iterative_scan_mode, parse_partial_by_workspace_env, HnswRuntimePolicy,

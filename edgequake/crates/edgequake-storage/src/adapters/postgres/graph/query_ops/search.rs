@@ -70,10 +70,22 @@ impl PostgresAGEGraphStorage {
             limit
         );
 
-        let rows = sqlx::query(&sql)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| StorageError::Database(format!("popular labels SQL failed: {}", e)))?;
+        // SPEC-089 / F-336-15 / LAW-H2: no app timeout on trait path — PG must kill.
+        let timeout_ms = super::super::helpers::graph_query_statement_timeout_ms();
+        let mut timed = super::super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let rows = match sqlx::query(&sql).fetch_all(&mut **timed.as_mut()).await {
+            Ok(r) => {
+                timed.commit().await?;
+                r
+            }
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "popular labels SQL failed: {}",
+                    e
+                )));
+            }
+        };
 
         Ok(rows
             .iter()
@@ -117,6 +129,10 @@ impl PostgresAGEGraphStorage {
         tracing::debug!(query = %query, escaped = %escaped_query, "search_labels starting");
         let search_text = Self::sql_vertex_search_text("v");
 
+        // SPEC-089 / F-336-15 / LAW-H2: autocomplete has no tokio budget — PG kill.
+        let timeout_ms = super::super::helpers::graph_query_statement_timeout_ms();
+        let mut timed = super::super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+
         // Try full-text search first (best for word matching).
         // 032: FTS must use bare label — scoped node_id (`{ws}::NAME`) breaks
         // keyword validation / prefix match against natural-language terms.
@@ -135,7 +151,7 @@ impl PostgresAGEGraphStorage {
             escaped_query, self.graph_name, tenant_and, limit
         );
 
-        let fts_rows = sqlx::query(&fts_sql).fetch_all(&mut *conn).await;
+        let fts_rows = sqlx::query(&fts_sql).fetch_all(&mut **timed.as_mut()).await;
 
         // If full-text search finds results, return them
         if let Ok(rows) = fts_rows {
@@ -146,6 +162,7 @@ impl PostgresAGEGraphStorage {
                     .collect();
 
                 if !labels.is_empty() {
+                    timed.commit().await?;
                     return Ok(labels);
                 }
             }
@@ -169,7 +186,9 @@ impl PostgresAGEGraphStorage {
             escaped_query, self.graph_name, tenant_and, limit
         );
 
-        let trgm_rows = sqlx::query(&trgm_sql).fetch_all(&mut *conn).await;
+        let trgm_rows = sqlx::query(&trgm_sql)
+            .fetch_all(&mut **timed.as_mut())
+            .await;
         tracing::debug!(sql = %trgm_sql, result = ?trgm_rows.as_ref().map(|r| r.len()).unwrap_or(0), "trigram search");
 
         // If trigram search finds results, return them
@@ -182,6 +201,7 @@ impl PostgresAGEGraphStorage {
                 tracing::debug!(labels = ?labels, "trigram search found labels");
 
                 if !labels.is_empty() {
+                    timed.commit().await?;
                     return Ok(labels);
                 }
             }
@@ -198,10 +218,22 @@ impl PostgresAGEGraphStorage {
             self.graph_name, escaped_query, tenant_and, limit
         );
 
-        let prefix_rows = sqlx::query(&prefix_sql)
-            .fetch_all(&mut *conn)
+        let prefix_rows = match sqlx::query(&prefix_sql)
+            .fetch_all(&mut **timed.as_mut())
             .await
-            .map_err(|e| StorageError::Database(format!("Search labels query failed: {}", e)))?;
+        {
+            Ok(r) => {
+                timed.commit().await?;
+                r
+            }
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "Search labels query failed: {}",
+                    e
+                )));
+            }
+        };
 
         let labels: Vec<String> = prefix_rows
             .iter()
@@ -275,10 +307,21 @@ impl PostgresAGEGraphStorage {
 
         tracing::debug!(sql = %sql, "search_nodes SQL");
 
-        let rows = sqlx::query(&sql)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| StorageError::Database(format!("Search nodes query failed: {}", e)))?;
+        // SPEC-089 Wave 3 / F-336-10: match run_timed_graph_query with PG kill.
+        let timeout_ms = super::super::helpers::graph_query_statement_timeout_ms();
+        let mut timed = super::super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let rows = match sqlx::query(&sql).fetch_all(&mut **timed.as_mut()).await {
+            Ok(r) => {
+                timed.commit().await?;
+                r
+            }
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "Search nodes query failed: {e}"
+                )));
+            }
+        };
 
         let results: Vec<(GraphNode, usize)> = rows
             .iter()
@@ -353,10 +396,21 @@ impl PostgresAGEGraphStorage {
             self.graph_name, vertex_where, self.graph_name, min_degree_val, limit
         );
 
-        let rows = sqlx::query(&sql)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| StorageError::Database(format!("Optimized SQL query failed: {}", e)))?;
+        // SPEC-089 Wave 3 / F-336-10: PG kill aligned with run_timed_graph_query.
+        let timeout_ms = super::super::helpers::graph_query_statement_timeout_ms();
+        let mut timed = super::super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let rows = match sqlx::query(&sql).fetch_all(&mut **timed.as_mut()).await {
+            Ok(r) => {
+                timed.commit().await?;
+                r
+            }
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "Optimized SQL query failed: {e}"
+                )));
+            }
+        };
 
         let mut results = Vec::with_capacity(limit);
 

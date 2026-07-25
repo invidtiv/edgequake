@@ -1,7 +1,12 @@
 use sqlx::Row;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::PostgresAGEGraphStorage;
 use crate::error::{Result, StorageError};
+
+/// Last prefix batch length seen by `pg_node_counts_by_source_prefixes_capped`
+/// (SPEC-089 e2e: prove list reconcile stays page-scoped).
+pub static LAST_SOURCE_PREFIX_COUNT_LEN: AtomicUsize = AtomicUsize::new(0);
 
 impl PostgresAGEGraphStorage {
     pub(super) async fn pg_node_count(&self) -> Result<usize> {
@@ -81,10 +86,21 @@ impl PostgresAGEGraphStorage {
             ..Default::default()
         };
         let sql = Self::vertex_count_sql(&self.graph_name, "v", &filter);
-        let row = sqlx::query(&sql)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| StorageError::Database(format!("node_count_by_workspace failed: {e}")))?;
+        // SPEC-089 Phase 4 / F-336-14 / LAW-H2: under stats 4s app budget.
+        let timeout_ms = super::helpers::WORKSPACE_STATS_STATEMENT_TIMEOUT_MS;
+        let mut timed = super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let row = match sqlx::query(&sql).fetch_one(&mut **timed.as_mut()).await {
+            Ok(r) => {
+                timed.commit().await?;
+                r
+            }
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "node_count_by_workspace failed: {e}"
+                )));
+            }
+        };
         let count: i64 = row.get(0);
         Ok(count as usize)
     }
@@ -105,10 +121,20 @@ impl PostgresAGEGraphStorage {
             relationship_type: None,
         };
         let sql = Self::edge_count_sql(&self.graph_name, "e", &filter);
-        let row = sqlx::query(&sql)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|e| StorageError::Database(format!("edge_count_by_workspace failed: {e}")))?;
+        let timeout_ms = super::helpers::WORKSPACE_STATS_STATEMENT_TIMEOUT_MS;
+        let mut timed = super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let row = match sqlx::query(&sql).fetch_one(&mut **timed.as_mut()).await {
+            Ok(r) => {
+                timed.commit().await?;
+                r
+            }
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "edge_count_by_workspace failed: {e}"
+                )));
+            }
+        };
         let count: i64 = row.get(0);
         Ok(count as usize)
     }
@@ -139,10 +165,21 @@ impl PostgresAGEGraphStorage {
              FROM {}.\"_ag_label_vertex\" v {} {}",
             self.graph_name, vertex_where, extra
         );
-        let count: i64 = sqlx::query_scalar(&sql)
-            .fetch_one(&mut *conn)
+        let timeout_ms = super::helpers::WORKSPACE_STATS_STATEMENT_TIMEOUT_MS;
+        let mut timed = super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let count: i64 = match sqlx::query_scalar(&sql)
+            .fetch_one(&mut **timed.as_mut())
             .await
-            .unwrap_or(0);
+        {
+            Ok(c) => {
+                timed.commit().await?;
+                c
+            }
+            Err(_) => {
+                let _ = timed.rollback().await;
+                0
+            }
+        };
         Ok(count as usize)
     }
 
@@ -156,16 +193,83 @@ impl PostgresAGEGraphStorage {
     /// probing those with GIN `@>` uses `idx_*_source_ids_gin` (~ms).
     pub(super) async fn pg_node_count_by_source_prefix(&self, prefix: &str) -> Result<usize> {
         let map = self
-            .pg_node_counts_by_source_prefixes(&[prefix.to_string()])
+            .pg_node_counts_by_source_prefixes_capped(
+                &[prefix.to_string()],
+                super::helpers::SOURCE_CHUNK_PROBE_LIMIT,
+            )
             .await?;
         Ok(map.get(prefix).copied().unwrap_or(0))
     }
 
-    /// Batch GIN `@>` probes for D document chunk prefixes — **one** round-trip
-    /// (SPEC-054 L1-a). Same cap semantics as the single-prefix path.
+    /// Batch GIN `@>` probes (SPEC-054 L1-a) with default probe cap.
     pub(super) async fn pg_node_counts_by_source_prefixes(
         &self,
         prefixes: &[String],
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        self.pg_node_counts_by_source_prefixes_capped(
+            prefixes,
+            super::helpers::SOURCE_CHUNK_PROBE_LIMIT,
+        )
+        .await
+    }
+
+    /// GIN `@>` entity counts with explicit probe bound (SPEC-089 / GH-336).
+    ///
+    /// LAW-H1: prefixes are processed in chunks of [`SOURCE_PREFIX_BATCH_LIMIT`].
+    /// LAW-H2: each batch runs inside a transaction with
+    /// `SET LOCAL statement_timeout` so abandoned Rust futures cannot leave
+    /// multi-minute zombies on the pool.
+    /// LAW-H4 / GH-331: MATERIALIZED probe-first JOIN on child `"Node"` GIN.
+    pub(super) async fn pg_node_counts_by_source_prefixes_capped(
+        &self,
+        prefixes: &[String],
+        probe_limit: usize,
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        use std::collections::HashMap;
+
+        let mut out = HashMap::with_capacity(prefixes.len());
+        if prefixes.is_empty() {
+            return Ok(out);
+        }
+
+        let probe_limit = super::helpers::source_count_probe_limit(probe_limit);
+        let batch_limit = super::helpers::SOURCE_PREFIX_BATCH_LIMIT;
+        let timeout_ms = super::helpers::SOURCE_COUNT_STATEMENT_TIMEOUT_MS;
+        LAST_SOURCE_PREFIX_COUNT_LEN.store(prefixes.len(), Ordering::Relaxed);
+
+        for (batch_index, batch) in prefixes.chunks(batch_limit).enumerate() {
+            match self
+                .pg_node_counts_by_source_prefixes_one_batch(
+                    batch,
+                    probe_limit,
+                    batch_index,
+                    timeout_ms,
+                )
+                .await
+            {
+                Ok(partial) => out.extend(partial),
+                Err(e) if !out.is_empty() => {
+                    // SPEC-089 EC-07: keep successful earlier batches; caller soft-fails rest.
+                    tracing::warn!(
+                        error = %e,
+                        batch_index,
+                        kept = out.len(),
+                        "SPEC-089: source-prefix count mid-batch failure — returning partial map"
+                    );
+                    return Ok(out);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(out)
+    }
+
+    async fn pg_node_counts_by_source_prefixes_one_batch(
+        &self,
+        prefixes: &[String],
+        probe_limit: usize,
+        batch_index: usize,
+        timeout_ms: u32,
     ) -> Result<std::collections::HashMap<String, usize>> {
         use std::collections::HashMap;
 
@@ -185,14 +289,12 @@ impl PostgresAGEGraphStorage {
             StorageError::Connection(format!("Failed to acquire connection: {}", e))
         })?;
 
-        let probe_limit = super::helpers::SOURCE_CHUNK_PROBE_LIMIT as i32;
-
-        // SPEC-084 / LAW-9 / GH-331 + IMP-031-08: child "Node" + MATERIALIZED
-        // probe-first GIN (same planner law as cascade discovery).
-        // GIN-only on `source_ids` — never OR unindexed source_chunk_ids.
+        // SPEC-084 / LAW-9 / GH-331 + IMP-031-08 + SPEC-089: child "Node" +
+        // MATERIALIZED probe-first GIN. GIN-only on `source_ids`.
         let probes_cte = super::helpers::source_ids_count_probes_cte_sql();
         let sql = format!(
             r#"
+            /* DATA-AGE-GRAPH-NODE-COUNTS-BY-SOURCE-PREFIXES */
             WITH {probes_cte},
             hits AS MATERIALIZED (
               SELECT pr.prefix, pr.ord, v.id
@@ -211,27 +313,51 @@ impl PostgresAGEGraphStorage {
             graph = self.graph_name,
         );
 
-        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+        let mut timed = super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let rows: std::result::Result<Vec<(String, i64)>, sqlx::Error> = sqlx::query_as(&sql)
             .bind(&normalized)
-            .bind(probe_limit)
-            .fetch_all(&mut *conn)
-            .await
-            .map_err(|e| {
-                StorageError::Database(format!("batched source-prefix GIN node count failed: {e}"))
-            })?;
+            .bind(probe_limit as i32)
+            .fetch_all(&mut **timed.as_mut())
+            .await;
 
-        // Map normalized prefix → count, then re-key to caller prefixes.
-        let mut by_normalized: HashMap<String, usize> = HashMap::with_capacity(rows.len());
-        for (prefix, cnt) in rows {
-            by_normalized.insert(prefix, cnt as usize);
+        match rows {
+            Ok(rows) => {
+                timed.commit().await?;
+                let mut by_normalized: HashMap<String, usize> = HashMap::with_capacity(rows.len());
+                for (prefix, cnt) in rows {
+                    by_normalized.insert(prefix, cnt as usize);
+                }
+                for (original, norm) in prefixes.iter().zip(normalized.iter()) {
+                    out.insert(
+                        original.clone(),
+                        by_normalized.get(norm).copied().unwrap_or(0),
+                    );
+                }
+                tracing::debug!(
+                    prefix_count = prefixes.len(),
+                    probe_limit,
+                    batch_index,
+                    statement_timeout_ms = timeout_ms,
+                    "SPEC-089: source-prefix GIN node count batch ok"
+                );
+                Ok(out)
+            }
+            Err(e) => {
+                let _ = timed.rollback().await;
+                let msg = e.to_string();
+                tracing::warn!(
+                    error = %msg,
+                    prefix_count = prefixes.len(),
+                    probe_limit,
+                    batch_index,
+                    statement_timeout_ms = timeout_ms,
+                    "SPEC-089 / GH-336: source-prefix GIN node count batch failed (timeout or DB)"
+                );
+                Err(StorageError::Database(format!(
+                    "batched source-prefix GIN node count failed: {msg}"
+                )))
+            }
         }
-        for (original, norm) in prefixes.iter().zip(normalized.iter()) {
-            out.insert(
-                original.clone(),
-                by_normalized.get(norm).copied().unwrap_or(0),
-            );
-        }
-        Ok(out)
     }
 
     /// ADMIN: wipe entire graph (IMP-031-06 native TRUNCATE-equivalent DELETE).

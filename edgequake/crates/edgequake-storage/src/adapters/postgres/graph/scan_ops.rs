@@ -6,6 +6,13 @@ use crate::error::{Result, StorageError};
 use crate::traits::{EdgeListFilter, GraphEdge, GraphNode, NodeListFilter, PagedGraphResult};
 use sqlx::Row;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// SPEC-089 Phase 4 e2e hook: how many source-prefix discovery SQL calls ran.
+///
+/// Incremented once per `pg_find_nodes_by_source_prefixes` /
+/// `pg_find_edges_by_source_prefixes` entry (F-336-12 amp proof).
+pub static SOURCE_PREFIX_DISCOVERY_CALLS: AtomicU64 = AtomicU64::new(0);
 
 impl PostgresAGEGraphStorage {
     fn build_node_where_clause(filter: &NodeListFilter) -> String {
@@ -216,6 +223,7 @@ impl PostgresAGEGraphStorage {
         if source_prefixes.is_empty() {
             return Ok(Vec::new());
         }
+        SOURCE_PREFIX_DISCOVERY_CALLS.fetch_add(1, Ordering::Relaxed);
 
         let (exact_ids, chunk_prefixes) = Self::source_prefix_probe_sets(source_prefixes);
         if exact_ids.is_empty() {
@@ -263,17 +271,42 @@ impl PostgresAGEGraphStorage {
             tenant_where = tenant_where_hits,
         );
 
-        let mut by_id: HashMap<String, GraphNode> = HashMap::new();
+        // SPEC-089 Wave 3 / F-336-08 / LAW-H2: kill discovery CROSS JOIN probes.
+        let timeout_ms = super::helpers::SOURCE_DISCOVERY_STATEMENT_TIMEOUT_MS;
+        let legacy_enabled = Self::source_prefix_legacy_enabled();
+        let legacy_sql = if legacy_enabled {
+            let legacy_where = Self::build_source_prefix_clause_legacy(props_expr, source_prefixes);
+            Some(format!(
+                "SELECT {props} AS props
+                 FROM {graph}.\"Node\" v
+                 WHERE {tenant_where} AND ({legacy_where})
+                 LIMIT 5000",
+                props = props_expr,
+                graph = self.graph_name,
+                tenant_where = tenant_where_v,
+                legacy_where = legacy_where
+            ))
+        } else {
+            None
+        };
 
-        let modern_rows = sqlx::query(&modern_sql)
+        let mut timed = super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let mut by_id: HashMap<String, GraphNode> = HashMap::new();
+        let modern_rows = match sqlx::query(&modern_sql)
             .bind(&exact_ids)
             .bind(&chunk_prefixes)
             .bind(probe_limit)
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut **timed.as_mut())
             .await
-            .map_err(|e| {
-                StorageError::Database(format!("Source-prefix node query failed: {}", e))
-            })?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "Source-prefix node query failed: {e}"
+                )));
+            }
+        };
         for row in modern_rows {
             let props: serde_json::Value = row.get("props");
             let Some(node_id) = props.get("node_id").and_then(|v| v.as_str()) else {
@@ -288,25 +321,20 @@ impl PostgresAGEGraphStorage {
             });
         }
 
-        // SPEC-071: legacy SeqScan only when explicitly enabled (pre-source_ids graphs).
-        if Self::source_prefix_legacy_enabled() {
-            let legacy_where = Self::build_source_prefix_clause_legacy(props_expr, source_prefixes);
-            let legacy_sql = format!(
-                "SELECT {props} AS props
-                 FROM {graph}.\"Node\" v
-                 WHERE {tenant_where} AND ({legacy_where})
-                 LIMIT 5000",
-                props = props_expr,
-                graph = self.graph_name,
-                tenant_where = tenant_where_v,
-                legacy_where = legacy_where
-            );
-            let legacy_rows = sqlx::query(&legacy_sql)
-                .fetch_all(&mut *conn)
+        // SPEC-071: legacy SeqScan only when explicitly enabled.
+        if let Some(legacy_sql) = legacy_sql {
+            let legacy_rows = match sqlx::query(&legacy_sql)
+                .fetch_all(&mut **timed.as_mut())
                 .await
-                .map_err(|e| {
-                    StorageError::Database(format!("Source-prefix node query failed: {}", e))
-                })?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = timed.rollback().await;
+                    return Err(StorageError::Database(format!(
+                        "Source-prefix node query failed: {e}"
+                    )));
+                }
+            };
             for row in legacy_rows {
                 let props: serde_json::Value = row.get("props");
                 let Some(node_id) = props.get("node_id").and_then(|v| v.as_str()) else {
@@ -321,6 +349,7 @@ impl PostgresAGEGraphStorage {
                 });
             }
         }
+        timed.commit().await?;
 
         let mut out: Vec<GraphNode> = by_id.into_values().collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -335,6 +364,7 @@ impl PostgresAGEGraphStorage {
         if source_prefixes.is_empty() {
             return Ok(Vec::new());
         }
+        SOURCE_PREFIX_DISCOVERY_CALLS.fetch_add(1, Ordering::Relaxed);
 
         let (exact_ids, chunk_prefixes) = Self::source_prefix_probe_sets(source_prefixes);
         if exact_ids.is_empty() {
@@ -355,8 +385,6 @@ impl PostgresAGEGraphStorage {
         let tenant_where_e = Self::build_edge_where_clause_for_discovery(filter);
         let props_expr = "ag_catalog.agtype_to_json(e.properties)";
         let probe_limit = super::helpers::SOURCE_CHUNK_PROBE_LIMIT as i32;
-
-        let mut by_key: HashMap<(String, String), GraphEdge> = HashMap::new();
 
         // SPEC-083 / X-03: never drop non-backfilled edges (eq_* IS NULL).
         let eq_present = self.eq_columns_present(&mut conn).await?;
@@ -401,15 +429,49 @@ impl PostgresAGEGraphStorage {
             src = src_expr,
             tgt = tgt_expr,
         );
-        let modern_rows = sqlx::query(&modern_sql)
+
+        let timeout_ms = super::helpers::SOURCE_DISCOVERY_STATEMENT_TIMEOUT_MS;
+        let legacy_sql = if Self::source_prefix_legacy_enabled() {
+            let legacy_where = Self::build_source_prefix_clause_legacy(props_expr, source_prefixes);
+            Some(format!(
+                "SELECT
+                    {props} AS props,
+                    {src} AS source_id,
+                    {tgt} AS target_id
+                 FROM {graph}.\"EDGE\" e
+                 WHERE {tenant_where}
+                   AND ({legacy_where})
+                   AND {src} IS NOT NULL
+                   AND {tgt} IS NOT NULL
+                 LIMIT 5000",
+                props = props_expr,
+                graph = self.graph_name,
+                tenant_where = tenant_where_e,
+                legacy_where = legacy_where,
+                src = src_expr,
+                tgt = tgt_expr,
+            ))
+        } else {
+            None
+        };
+
+        let mut timed = super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
+        let mut by_key: HashMap<(String, String), GraphEdge> = HashMap::new();
+        let modern_rows = match sqlx::query(&modern_sql)
             .bind(&exact_ids)
             .bind(&chunk_prefixes)
             .bind(probe_limit)
-            .fetch_all(&mut *conn)
+            .fetch_all(&mut **timed.as_mut())
             .await
-            .map_err(|e| {
-                StorageError::Database(format!("Source-prefix edge query failed: {}", e))
-            })?;
+        {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = timed.rollback().await;
+                return Err(StorageError::Database(format!(
+                    "Source-prefix edge query failed: {e}"
+                )));
+            }
+        };
         for row in modern_rows {
             let props: serde_json::Value = row.get("props");
             let source: String = row.get("source_id");
@@ -429,33 +491,19 @@ impl PostgresAGEGraphStorage {
                 });
         }
 
-        if Self::source_prefix_legacy_enabled() {
-            let legacy_where = Self::build_source_prefix_clause_legacy(props_expr, source_prefixes);
-            // Legacy enrich: still on child "EDGE"; endpoints via eq_* (no ORDER BY).
-            let legacy_sql = format!(
-                "SELECT
-                    {props} AS props,
-                    {src} AS source_id,
-                    {tgt} AS target_id
-                 FROM {graph}.\"EDGE\" e
-                 WHERE {tenant_where}
-                   AND ({legacy_where})
-                   AND {src} IS NOT NULL
-                   AND {tgt} IS NOT NULL
-                 LIMIT 5000",
-                props = props_expr,
-                graph = self.graph_name,
-                tenant_where = tenant_where_e,
-                legacy_where = legacy_where,
-                src = src_expr,
-                tgt = tgt_expr,
-            );
-            let legacy_rows = sqlx::query(&legacy_sql)
-                .fetch_all(&mut *conn)
+        if let Some(legacy_sql) = legacy_sql {
+            let legacy_rows = match sqlx::query(&legacy_sql)
+                .fetch_all(&mut **timed.as_mut())
                 .await
-                .map_err(|e| {
-                    StorageError::Database(format!("Source-prefix edge query failed: {}", e))
-                })?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = timed.rollback().await;
+                    return Err(StorageError::Database(format!(
+                        "Source-prefix edge query failed: {e}"
+                    )));
+                }
+            };
             for row in legacy_rows {
                 let props: serde_json::Value = row.get("props");
                 let source: String = row.get("source_id");
@@ -475,6 +523,7 @@ impl PostgresAGEGraphStorage {
                     });
             }
         }
+        timed.commit().await?;
 
         let mut out: Vec<GraphEdge> = by_key.into_values().collect();
         out.sort_by(|a, b| (&a.source, &a.target).cmp(&(&b.source, &b.target)));

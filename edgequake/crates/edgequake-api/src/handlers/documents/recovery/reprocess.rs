@@ -23,8 +23,6 @@ use crate::services::pending_doc_task_reconcile::{
 };
 use crate::services::resolve_process_options_from_metadata;
 
-use super::super::storage_helpers::cleanup_document_graph_data;
-
 /// Reprocess failed documents.
 #[utoipa::path(
     post,
@@ -417,7 +415,9 @@ pub(crate) async fn run_reprocess_failed(
             &workspace_id_for_tasks,
         )
         .await;
-        // SPEC-059: full retract (vectors + graph sources) before reprocess.
+        // SPEC-059 + SPEC-089 F-336-12 / LAW-H1: one retract SSOT (vectors + graph).
+        // Do **not** call `cleanup_document_graph_data` after retract — that re-ran
+        // the same cascade discovery (double CROSS JOIN ×256 → pool amp).
         let retract_stats = crate::services::retract_document_indexes(
             &state.storage.graph_storage,
             &vector,
@@ -425,40 +425,18 @@ pub(crate) async fn run_reprocess_failed(
             doc_id,
         )
         .await;
-        let cleanup_admit_stats = match cleanup_document_graph_data(
-            doc_id,
-            &state.storage.graph_storage,
-            Some(&vector),
-        )
-        .await
-        {
-            Ok(stats) => {
-                tracing::info!(
-                    document_id = %doc_id,
-                    entities_removed = stats.entities_removed.max(retract_stats.entities_removed),
-                    entities_updated = stats.entities_updated,
-                    relationships_removed = stats
-                        .relationships_removed
-                        .max(retract_stats.relationships_removed),
-                    embeddings_deleted = retract_stats.embeddings_deleted,
-                    "Cleaned up partial data before reprocessing"
-                );
-                Some(crate::services::reprocess_stage_reset::CleanupAdmitStats {
-                    entities_removed: stats.entities_removed.max(retract_stats.entities_removed),
-                    relationships_removed: stats
-                        .relationships_removed
-                        .max(retract_stats.relationships_removed),
-                })
-            }
-            Err(e) => {
-                tracing::warn!(
-                    document_id = %doc_id,
-                    error = %e,
-                    "Failed to cleanup partial data before reprocessing, continuing anyway"
-                );
-                None
-            }
-        };
+        tracing::info!(
+            document_id = %doc_id,
+            entities_removed = retract_stats.entities_removed,
+            entities_updated = retract_stats.entities_updated,
+            relationships_removed = retract_stats.relationships_removed,
+            embeddings_deleted = retract_stats.embeddings_deleted,
+            "Retracted indexes before reprocessing (single cascade)"
+        );
+        let cleanup_admit_stats = Some(crate::services::reprocess_stage_reset::CleanupAdmitStats {
+            entities_removed: retract_stats.entities_removed,
+            relationships_removed: retract_stats.relationships_removed,
+        });
 
         // Transition cleaning → queued (or merging) once graph cleanup finishes.
         // True admission: waiting for a free worker / merge start.

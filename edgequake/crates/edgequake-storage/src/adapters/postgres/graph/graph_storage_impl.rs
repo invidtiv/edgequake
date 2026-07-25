@@ -306,6 +306,15 @@ impl GraphStorageAnalyticsOps for PostgresAGEGraphStorage {
     ) -> Result<std::collections::HashMap<String, usize>> {
         self.pg_node_counts_by_source_prefixes(prefixes).await
     }
+
+    async fn node_counts_by_source_prefixes_capped(
+        &self,
+        prefixes: &[String],
+        probe_limit: usize,
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        self.pg_node_counts_by_source_prefixes_capped(prefixes, probe_limit)
+            .await
+    }
 }
 
 #[async_trait]

@@ -158,3 +158,4 @@ Invariant violated: **LAW-9 Index locality**.
 - M038 / M070 migrations  
 - SPEC-083 LAW-8 (tests prove production defaults)  
 - Related: #317 (same pool class of failure under N× cascades)
+- Related open scale defect: [#336](https://github.com/raphaelmansuy/edgequake/issues/336) / [SPEC-089](../../089-health-check/) — Cartesian `prefixes × 256` + uncancellable timeout (query **shape**, not JOIN locality)

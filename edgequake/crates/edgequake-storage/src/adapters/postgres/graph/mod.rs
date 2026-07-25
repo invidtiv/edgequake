@@ -242,6 +242,15 @@ mod nodes_ops;
 mod query_ops;
 mod scan_ops;
 
+/// SPEC-089 e2e hook: last prefix count passed to GIN node-count reconcile.
+pub use analytics_ops::LAST_SOURCE_PREFIX_COUNT_LEN;
+
+/// SPEC-089 Phase 4 e2e hook: source-prefix discovery call counter (F-336-12).
+pub use scan_ops::SOURCE_PREFIX_DISCOVERY_CALLS;
+
+/// SPEC-089 Phase 4: interactive read-path PG kill budget (F-336-13).
+pub use helpers::interactive_statement_timeout_ms;
+
 /// SPEC-034 IMP-01: Check whether the native SQL write path is enabled.
 ///
 /// # WHY: Feature flag for safe rollout

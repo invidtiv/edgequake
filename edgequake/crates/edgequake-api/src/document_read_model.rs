@@ -507,8 +507,12 @@ pub fn merge_document_summaries(
 /// metadata scoped to a legacy workspace being dropped, leaving the relational
 /// backfill — whose `entity_count` column was never refreshed (P-A1 fixes the
 /// write side; this is the read-side safety net). AGE is the SSOT for entity
-/// counts, so we fall back to `node_counts_by_source_prefixes` (SPEC-054 L1-a:
-/// **one** AGE round-trip) for documents whose current `entity_count` is 0.
+/// counts, so we fall back to `node_counts_by_source_prefixes_capped`
+/// (SPEC-054 L1-a + SPEC-089 / GH-336) for documents whose current
+/// `entity_count` is 0.
+///
+/// LAW-H1 / LAW-H5: callers must pass the **paginated page** (or a similarly
+/// bounded slice), never the full corpus. Write-path P-A1 remains primary.
 ///
 /// Whether a list row is eligible for AGE entity-count reconcile.
 ///
@@ -523,8 +527,25 @@ pub(crate) fn should_reconcile_entity_count(
         && matches!(status, Some("completed" | "indexed" | "partial_failure"))
 }
 
+/// Probe series upper bound for P-A3 (mirrors storage `source_count_probe_limit`).
+#[inline]
+pub(crate) fn reconcile_probe_limit_from_chunk_counts(
+    chunk_counts: impl Iterator<Item = usize>,
+) -> usize {
+    const MAX: usize = 256;
+    let max_c = chunk_counts.max().unwrap_or(0);
+    if max_c == 0 {
+        MAX
+    } else {
+        max_c.clamp(1, MAX)
+    }
+}
+
 /// Best-effort: AGE failures/timeouts are swallowed (counts stay as-is) so the
 /// interactive list never fails with `read_path_busy` due to a graph probe.
+///
+/// SPEC-089 / LAW-H2: Rust timeout is a client budget; storage also applies
+/// `SET LOCAL statement_timeout` so cancelled work cannot hold pool slots.
 pub async fn reconcile_entity_counts_with_graph(
     storage: &crate::state::StorageRuntime,
     documents: &mut [DocumentSummary],
@@ -549,14 +570,19 @@ pub async fn reconcile_entity_counts_with_graph(
         .map(|(_, doc_id)| kv_keys::doc_chunk_prefix(doc_id))
         .collect();
 
+    let probe_limit = reconcile_probe_limit_from_chunk_counts(
+        candidates.iter().map(|(i, _)| documents[*i].chunk_count),
+    );
+
     // Hard cap well under EDGEQUAKE_DOCUMENTS_READ_TIMEOUT_MS so list/detail
     // keep serving KV counts when AGE is slow (142k+ node graphs).
+    // Storage `SOURCE_COUNT_STATEMENT_TIMEOUT_MS` (300ms) is the server kill.
     const AGE_RECONCILE_TIMEOUT: Duration = Duration::from_millis(400);
     let counts = match tokio::time::timeout(
         AGE_RECONCILE_TIMEOUT,
         storage
             .graph_storage
-            .node_counts_by_source_prefixes(&prefixes),
+            .node_counts_by_source_prefixes_capped(&prefixes, probe_limit),
     )
     .await
     {
@@ -565,6 +591,7 @@ pub async fn reconcile_entity_counts_with_graph(
             tracing::warn!(
                 error = %e,
                 candidate_count = candidates.len(),
+                probe_limit,
                 "P-A3: batched AGE entity_count fallback failed (non-fatal) — leaving counts as-is"
             );
             return;
@@ -572,6 +599,7 @@ pub async fn reconcile_entity_counts_with_graph(
         Err(_) => {
             tracing::warn!(
                 candidate_count = candidates.len(),
+                probe_limit,
                 timeout_ms = AGE_RECONCILE_TIMEOUT.as_millis() as u64,
                 "P-A3: AGE entity_count reconcile timed out — serving KV counts"
             );
@@ -612,6 +640,26 @@ mod tests {
         assert!(!should_reconcile_entity_count(Some("completed"), Some(7)));
         assert!(!should_reconcile_entity_count(Some("failed"), Some(0)));
         assert!(!should_reconcile_entity_count(Some("pending"), None));
+    }
+
+    #[test]
+    fn iss089_probe_limit_from_chunk_counts() {
+        assert_eq!(
+            reconcile_probe_limit_from_chunk_counts(std::iter::empty()),
+            256
+        );
+        assert_eq!(
+            reconcile_probe_limit_from_chunk_counts([0, 0].into_iter()),
+            256
+        );
+        assert_eq!(
+            reconcile_probe_limit_from_chunk_counts([3, 12, 5].into_iter()),
+            12
+        );
+        assert_eq!(
+            reconcile_probe_limit_from_chunk_counts([400].into_iter()),
+            256
+        );
     }
 
     #[test]
