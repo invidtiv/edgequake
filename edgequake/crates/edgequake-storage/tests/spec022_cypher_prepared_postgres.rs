@@ -72,8 +72,7 @@ fn spec022_nodes_ops_use_parameterized_cypher() {
         "pg_has_node/pg_get_node must use native batch lookup (SPEC-088), not Cypher MATCH"
     );
     assert!(
-        mutate.contains("cypher_execute_bound")
-            && mutate.contains("native_graph_writes_enabled"),
+        mutate.contains("cypher_execute_bound") && mutate.contains("native_graph_writes_enabled"),
         "pg_delete_node must keep parameterized Cypher execute as native-off fallback"
     );
 }
