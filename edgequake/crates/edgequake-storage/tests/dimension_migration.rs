@@ -50,12 +50,18 @@ fn test_workspace_vector_config_table_names() {
 
     // OpenAI dimension
     let config_openai = WorkspaceVectorConfig::new(workspace_id, 1536);
-    assert_eq!(config_openai.table_name(), "eq_default_ws_4e32a055_vectors");
+    assert_eq!(
+        config_openai.table_name(),
+        "eq_default_ws_4e32a055_9722_40f9_b03e_ade870b07604_vectors"
+    );
     assert_eq!(config_openai.dimension, 1536);
 
     // Ollama dimension
     let config_ollama = WorkspaceVectorConfig::new(workspace_id, 768);
-    assert_eq!(config_ollama.table_name(), "eq_default_ws_4e32a055_vectors");
+    assert_eq!(
+        config_ollama.table_name(),
+        "eq_default_ws_4e32a055_9722_40f9_b03e_ade870b07604_vectors"
+    );
     assert_eq!(config_ollama.dimension, 768);
 
     // Same workspace ID generates same table name regardless of dimension

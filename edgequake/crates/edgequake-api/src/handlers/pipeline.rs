@@ -346,9 +346,19 @@ pub async fn get_queue_metrics(
     };
 
     #[cfg(feature = "postgres")]
-    let pool_util = state.pg_pool.as_ref().and_then(|pool| {
-        crate::store_contention::pool_utilization(pool.size(), pool.num_idle() as u32)
-    });
+    let pool_util = state
+        .pool_bundle
+        .as_ref()
+        .map(crate::store_contention::role_utils_from_bundle)
+        .and_then(|roles| crate::store_contention::max_role_pool_utilization(&roles))
+        .or_else(|| {
+            state.pg_pool.as_ref().and_then(|pool| {
+                crate::store_contention::pool_utilization(
+                    pool.size(),
+                    pool.num_idle().min(u32::MAX as usize) as u32,
+                )
+            })
+        });
     #[cfg(not(feature = "postgres"))]
     let pool_util: Option<f64> = None;
     let store = crate::store_contention::assess_store_contention(pool_util);

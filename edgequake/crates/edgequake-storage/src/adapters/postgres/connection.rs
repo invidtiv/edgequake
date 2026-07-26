@@ -16,20 +16,70 @@
 //! - [`BR0246`]: Connection reuse via pooling
 //! - [`BR0247`]: Extension availability validation
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
+use super::config::resolve_pool_max_connections;
 use super::config::PostgresConfig;
 use crate::error::{Result, StorageError};
+
+/// SPEC-090 F-090-07 / LAW-P4: pin `search_path` on connect and reset session
+/// state on release so DDL/reconcile GUCs cannot leak across pooled checkouts.
+pub fn with_session_hygiene(options: PgPoolOptions) -> PgPoolOptions {
+    options
+        // WHY: Force search_path=public on every connection.
+        // After migration 001 creates the 'edgequake' schema, PostgreSQL's
+        // default search_path "$user",public resolves "$user"="edgequake" to
+        // that schema first. Unqualified table references in storage queries
+        // (e.g. INSERT INTO documents) could resolve to edgequake views instead
+        // of the actual public tables. Pinning search_path to public ensures
+        // consistent, correct table resolution on all pool connections.
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET search_path TO public")
+                    .execute(conn)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .after_release(|conn, _meta| {
+            Box::pin(async move {
+                // RESET ALL clears session GUCs leaked by DDL/reconcile (statement_timeout,
+                // maintenance_work_mem, search_path) without discarding sqlx prepared statements.
+                // Must not run inside an open transaction (sqlx releases after end).
+                if let Err(e) = sqlx::query("RESET ALL").execute(&mut *conn).await {
+                    tracing::warn!(
+                        error = %e,
+                        "SPEC-090: after_release RESET ALL failed; dropping connection"
+                    );
+                    return Ok(false);
+                }
+                if let Err(e) = sqlx::query("SET search_path TO public")
+                    .execute(&mut *conn)
+                    .await
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "SPEC-090: after_release search_path pin failed; dropping connection"
+                    );
+                    return Ok(false);
+                }
+                Ok(true)
+            })
+        })
+}
 
 /// PostgreSQL connection pool wrapper.
 #[derive(Clone)]
 pub struct PostgresPool {
     pool: Arc<RwLock<Option<PgPool>>>,
     config: PostgresConfig,
+    /// Set during extension setup — AGE available for graph storage.
+    graph_extension_available: Arc<AtomicBool>,
 }
 
 impl PostgresPool {
@@ -38,6 +88,7 @@ impl PostgresPool {
         Self {
             pool: Arc::new(RwLock::new(None)),
             config,
+            graph_extension_available: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -49,7 +100,26 @@ impl PostgresPool {
         Self {
             pool: Arc::new(RwLock::new(Some(pool))),
             config,
+            graph_extension_available: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Whether Apache AGE extension was successfully enabled at pool init.
+    pub fn graph_extension_available(&self) -> bool {
+        self.graph_extension_available.load(Ordering::Relaxed)
+    }
+
+    /// Probe `pg_extension` for AGE (used when pool was from_existing without setup).
+    pub async fn probe_graph_extension_available(&self) -> Result<bool> {
+        let pool = self.get().await?;
+        let available: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'age')")
+                .fetch_one(&pool)
+                .await
+                .map_err(|e| StorageError::Database(format!("AGE extension probe failed: {e}")))?;
+        self.graph_extension_available
+            .store(available, Ordering::Relaxed);
+        Ok(available)
     }
 
     /// Get the configuration.
@@ -65,29 +135,18 @@ impl PostgresPool {
             return Ok(());
         }
 
-        let pool = PgPoolOptions::new()
-            .max_connections(self.config.max_connections)
-            .min_connections(self.config.min_connections)
-            .acquire_timeout(self.config.connect_timeout)
-            .idle_timeout(Some(self.config.idle_timeout))
-            // WHY: Force search_path=public on every connection.
-            // After migration 001 creates the 'edgequake' schema, PostgreSQL's
-            // default search_path "$user",public resolves "$user"="edgequake" to
-            // that schema first. Unqualified table references in storage queries
-            // (e.g. INSERT INTO documents) could resolve to edgequake views instead
-            // of the actual public tables. Pinning search_path to public ensures
-            // consistent, correct table resolution on all pool connections.
-            .after_connect(|conn, _| {
-                Box::pin(async move {
-                    sqlx::query("SET search_path TO public")
-                        .execute(conn)
-                        .await
-                        .map(|_| ())
-                })
-            })
-            .connect(&self.config.connection_url())
-            .await
-            .map_err(|e| StorageError::Connection(format!("Failed to connect: {}", e)))?;
+        let max_connections = resolve_pool_max_connections(self.config.max_connections);
+
+        let pool = with_session_hygiene(
+            PgPoolOptions::new()
+                .max_connections(max_connections)
+                .min_connections(self.config.min_connections)
+                .acquire_timeout(self.config.connect_timeout)
+                .idle_timeout(Some(self.config.idle_timeout)),
+        )
+        .connect(&self.config.connection_url())
+        .await
+        .map_err(|e| StorageError::Connection(format!("Failed to connect: {}", e)))?;
 
         // Enable required extensions
         self.setup_extensions(&pool).await?;
@@ -132,8 +191,8 @@ impl PostgresPool {
                 ))
             })?;
 
-        // Enable Apache AGE extension
-        match sqlx::query("CREATE EXTENSION IF NOT EXISTS age CASCADE")
+        // Enable Apache AGE extension (fail-closed unless opt-out — SPEC-090 F-090-19)
+        let age_ok = match sqlx::query("CREATE EXTENSION IF NOT EXISTS age CASCADE")
             .execute(pool)
             .await
         {
@@ -155,17 +214,37 @@ impl PostgresPool {
                     .map_err(|e| {
                         StorageError::Database(format!("Failed to reset search_path: {}", e))
                     })?;
+                true
             }
             Err(e) => {
-                // AGE is optional - log warning but continue
-                tracing::warn!(
-                    "Apache AGE extension not available: {}. Graph operations will use fallback.",
-                    e
-                );
+                if Self::allow_no_graph_extension() {
+                    tracing::warn!(
+                        "Apache AGE extension not available: {}. Graph operations will use fallback (EDGEQUAKE_ALLOW_NO_GRAPH=1).",
+                        e
+                    );
+                    false
+                } else {
+                    return Err(StorageError::Database(format!(
+                        "Apache AGE extension required but unavailable: {e}. \
+                         Set EDGEQUAKE_ALLOW_NO_GRAPH=1 to start without graph storage."
+                    )));
+                }
             }
-        }
+        };
+        self.graph_extension_available
+            .store(age_ok, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    fn allow_no_graph_extension() -> bool {
+        matches!(
+            std::env::var("EDGEQUAKE_ALLOW_NO_GRAPH")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     }
 
     /// Execute a raw query (for testing).

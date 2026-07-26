@@ -328,11 +328,17 @@ pub fn record_task_queue_stats(pending: u64, processing: u64, failed: u64) {
 
 /// Update DB pool gauges (call before Prometheus scrape when pool is available).
 pub fn record_db_pool_stats(size: u32, idle: u32) {
+    record_db_pool_stats_for_role("primary", size, idle);
+}
+
+/// Per-role pool gauges (SPEC-090 F-090-28): `role` ∈ query|ingest|queue|admin.
+pub fn record_db_pool_stats_for_role(role: &str, size: u32, idle: u32) {
     init_metrics();
     let active = size.saturating_sub(idle);
-    gauge!(DB_POOL_CONNECTIONS, "state" => "total").set(size as f64);
-    gauge!(DB_POOL_CONNECTIONS, "state" => "idle").set(idle as f64);
-    gauge!(DB_POOL_CONNECTIONS, "state" => "active").set(active as f64);
+    let role = role.to_string();
+    gauge!(DB_POOL_CONNECTIONS, "state" => "total", "role" => role.clone()).set(size as f64);
+    gauge!(DB_POOL_CONNECTIONS, "state" => "idle", "role" => role.clone()).set(idle as f64);
+    gauge!(DB_POOL_CONNECTIONS, "state" => "active", "role" => role).set(active as f64);
 }
 
 /// Record document/PDF pipeline processing (task processor layer).

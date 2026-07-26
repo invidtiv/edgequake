@@ -365,7 +365,8 @@ impl DocumentTaskProcessor {
         }
 
         // Update task progress — extract+embed done; persist owns indexing.
-        task.update_progress("extraction_complete".to_string(), 4, 30);
+        self.bump_task_progress(task, "extraction_complete".to_string(), 4, 30)
+            .await;
 
         // ── CANCELLATION GATE: after extraction, before embedding storage ──
         self.check_cancelled(&cancel_token, "post-extraction", &document_id)

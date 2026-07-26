@@ -42,7 +42,8 @@ impl DocumentTaskProcessor {
             }
 
             let pct = ((idx as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as u8;
-            task.update_progress(format!("deleting {document_id}"), idx as u32, pct);
+            self.bump_task_progress(task, format!("deleting {document_id}"), idx as u32, pct)
+                .await;
 
             match build_deletion_task_data(state, document_id, &tenant_ctx, &data.batch_track_id)
                 .await
@@ -98,7 +99,8 @@ impl DocumentTaskProcessor {
             }
         }
 
-        task.update_progress("batch_deletion_complete".to_string(), 1, 100);
+        self.bump_task_progress(task, "batch_deletion_complete".to_string(), 1, 100)
+            .await;
 
         Ok(serde_json::json!({
             "batch_track_id": data.batch_track_id,

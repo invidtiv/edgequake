@@ -144,9 +144,13 @@ pub struct AppState {
     /// Rate limiter for tenant-based rate limiting.
     pub rate_limiter: RateLimiter,
 
-    /// PostgreSQL pool (only available when using postgres feature).
+    /// PostgreSQL ingest/primary pool (backward-compat; prefer `pool_bundle`).
     #[cfg(feature = "postgres")]
     pub pg_pool: Option<PgPool>,
+
+    /// SPEC-090 F-090-28: role-split pools (query/ingest/queue/admin).
+    #[cfg(feature = "postgres")]
+    pub pool_bundle: Option<edgequake_storage::PgPoolBundle>,
 
     /// Server start time for uptime calculation.
     pub start_time: std::time::Instant,

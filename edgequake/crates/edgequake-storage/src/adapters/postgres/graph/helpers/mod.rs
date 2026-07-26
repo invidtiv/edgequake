@@ -16,8 +16,13 @@ mod escape;
 mod graph_lifecycle;
 mod session;
 mod source_lineage_sql;
-mod statement_timeout;
 mod vertex_filter;
+
+pub(in crate::adapters::postgres::graph) use super::super::statement_timeout::{
+    graph_query_statement_timeout_ms, LocalTimeoutTx,
+};
+
+pub use super::super::statement_timeout::interactive_statement_timeout_ms;
 
 pub(in crate::adapters::postgres::graph) use eq_id_sql::{
     coalesce_endpoint, eq_id_fallback_env_enabled, prop_only_endpoint,
@@ -29,13 +34,6 @@ pub(in crate::adapters::postgres::graph) use source_lineage_sql::{
     SOURCE_COUNT_STATEMENT_TIMEOUT_MS, SOURCE_DISCOVERY_STATEMENT_TIMEOUT_MS,
     SOURCE_PREFIX_BATCH_LIMIT, WORKSPACE_STATS_STATEMENT_TIMEOUT_MS,
 };
-
-pub(in crate::adapters::postgres::graph) use statement_timeout::{
-    graph_query_statement_timeout_ms, LocalTimeoutTx,
-};
-
-/// SPEC-089 Phase 4 / F-336-13 — public so API read-path can assert LAW-H2 alignment.
-pub use statement_timeout::interactive_statement_timeout_ms;
 
 #[cfg(test)]
 pub(in crate::adapters::postgres::graph) use source_lineage_sql::jsonb_matches_doc_source_prefix_modern;

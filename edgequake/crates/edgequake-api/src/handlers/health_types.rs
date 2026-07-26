@@ -319,6 +319,10 @@ pub struct ComponentHealth {
     /// Graph storage status.
     pub graph_storage: bool,
 
+    /// Apache AGE extension available (PostgreSQL only, SPEC-090 F-090-19).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub graph_available: Option<bool>,
+
     /// LLM provider status.
     pub llm_provider: bool,
 
@@ -397,6 +401,7 @@ mod tests {
                 kv_storage: true,
                 vector_storage: true,
                 graph_storage: true,
+                graph_available: None,
                 llm_provider: true,
                 eq_id_schema: None,
             },
@@ -432,6 +437,7 @@ mod tests {
                 kv_storage: true,
                 vector_storage: true,
                 graph_storage: true,
+                graph_available: None,
                 llm_provider: true,
                 eq_id_schema: Some(true),
             },
@@ -481,6 +487,7 @@ mod tests {
             kv_storage: false,
             vector_storage: false,
             graph_storage: false,
+            graph_available: None,
             llm_provider: false,
             eq_id_schema: Some(false),
         };
@@ -504,6 +511,7 @@ mod tests {
                 kv_storage: true,
                 vector_storage: true,
                 graph_storage: true,
+                graph_available: None,
                 llm_provider: false,
                 eq_id_schema: Some(true),
             },
@@ -527,6 +535,7 @@ mod tests {
             kv_storage: true,
             vector_storage: true,
             graph_storage: true,
+            graph_available: None,
             llm_provider: true,
             eq_id_schema: Some(true),
         };
@@ -570,6 +579,7 @@ mod tests {
                 kv_storage: true,
                 vector_storage: true,
                 graph_storage: true,
+                graph_available: None,
                 llm_provider: true,
                 eq_id_schema: Some(true),
             },

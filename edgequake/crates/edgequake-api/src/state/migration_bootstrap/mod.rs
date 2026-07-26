@@ -796,6 +796,46 @@ pub fn is_ready_for_traffic(report: &Option<MigrationBootstrapReport>) -> bool {
     readiness_blockers(report).is_empty()
 }
 
+/// Dev/serving escape: allow sqlx migrate + heavy reconcile on boot (SPEC-090 F-090-20b).
+pub fn allow_boot_migrate() -> bool {
+    matches!(
+        std::env::var("EDGEQUAKE_ALLOW_BOOT_MIGRATE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Set by `edgequake migrate` so support DDL apply runs without the boot escape.
+pub fn migrate_cli_mode() -> bool {
+    matches!(
+        std::env::var("EDGEQUAKE_MIGRATE_CLI")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// Serving-boot entry: migrate+reconcile when escape set; else fail-closed on pending.
+pub async fn bootstrap_for_serving(pool: &PgPool) -> Result<MigrationBootstrapReport, sqlx::Error> {
+    let applied_before = fetch_applied_versions(pool).await?;
+    let pending: Vec<_> = MIGRATOR
+        .migrations
+        .iter()
+        .filter(|m| !applied_before.contains(&m.version))
+        .map(|m| m.version)
+        .collect();
+    if !pending.is_empty() && !allow_boot_migrate() && !migrate_cli_mode() {
+        return Err(sqlx::Error::Protocol(format!(
+            "Pending sqlx migrations {pending:?}. Run `edgequake migrate` or set \
+             EDGEQUAKE_ALLOW_BOOT_MIGRATE=1 (dev escape)."
+        )));
+    }
+    run_postgres_migrations(pool).await
+}
+
 /// Run sqlx migrations plus size-aware 038 apply with structured progression logs.
 pub async fn run_postgres_migrations(
     pool: &PgPool,
@@ -804,6 +844,8 @@ pub async fn run_postgres_migrations(
         target: "edgequake.migration",
         step = "bootstrap_start",
         total_embedded = MIGRATOR.migrations.len(),
+        allow_boot_migrate = allow_boot_migrate(),
+        migrate_cli = migrate_cli_mode(),
         "Database migration bootstrap starting"
     );
 
@@ -813,6 +855,15 @@ pub async fn run_postgres_migrations(
         .iter()
         .filter(|m| !applied_before.contains(&m.version))
         .collect();
+
+    // Serving verify-only: never apply pending sqlx migrations without escape/CLI.
+    if !pending.is_empty() && !allow_boot_migrate() && !migrate_cli_mode() {
+        return Err(sqlx::Error::Protocol(format!(
+            "Refusing to apply {} pending migrations without EDGEQUAKE_ALLOW_BOOT_MIGRATE \
+             or edgequake migrate (SPEC-090 F-090-20b)",
+            pending.len()
+        )));
+    }
 
     info!(
         target: "edgequake.migration",
@@ -1390,8 +1441,32 @@ async fn fetch_applied_versions(pool: &PgPool) -> Result<HashSet<i64>, sqlx::Err
     Ok(rows.into_iter().collect())
 }
 
+/// Pending sqlx migrations as `(version, description)` for operator console (`edgequake migrate`).
+pub async fn list_pending_migrations(pool: &PgPool) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    let applied = fetch_applied_versions(pool).await?;
+    let mut pending: Vec<(i64, String)> = MIGRATOR
+        .migrations
+        .iter()
+        .filter(|m| !applied.contains(&m.version))
+        .map(|m| (m.version, m.description.to_string()))
+        .collect();
+    pending.sort_by_key(|(v, _)| *v);
+    Ok(pending)
+}
+
+/// Description for an embedded migration version (empty string if unknown).
+pub fn migration_description(version: i64) -> String {
+    MIGRATOR
+        .migrations
+        .iter()
+        .find(|m| m.version == version)
+        .map(|m| m.description.to_string())
+        .unwrap_or_default()
+}
+
 mod helpers;
 mod reconcile;
+mod reconcile_state;
 
 pub use helpers::large_graph_threshold;
 
@@ -1830,6 +1905,8 @@ mod tests {
         assert!(helpers::extension_version_at_least("1.7.0", "1.6.0"));
         assert!(!helpers::extension_version_at_least("0.7.4", "0.8.0"));
         assert!(!helpers::extension_version_at_least("1.5.0", "1.6.0"));
+        assert!(!helpers::extension_version_at_least("0.8.0-rc1", "0.8.0"));
+        assert!(helpers::extension_version_at_least("0.8.0", "0.8.0-rc1"));
     }
 
     #[test]

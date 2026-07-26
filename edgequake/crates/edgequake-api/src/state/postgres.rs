@@ -140,52 +140,19 @@ impl AppState {
         let user = url.username().to_string();
         let password = url.password().unwrap_or("").to_string();
 
-        // Create PostgreSQL configuration
-        // WHY 32 connections (env-configurable via DATABASE_POOL_SIZE):
-        // The frontend polls ~8 concurrent endpoints every 2s. Pipeline workers
-        // hold connections for the full processing duration (embedding = minutes).
-        // 10 connections are exhausted instantly under any real load, causing
-        // "pool timed out" 500s → polling feedback loop. QW5: raised 25→32 to
-        // match PostgresConfig::default max_connections and absorb the new
-        // bounded-concurrency batch ingestion (EDGEQUAKE_INGEST_CONCURRENCY).
-        let db_pool_size: u32 = std::env::var("DATABASE_POOL_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32);
+        // SPEC-090 F-090-28: role-split pools (query/ingest/queue/admin).
+        // Optional DATABASE_READ_URL feeds the query pool (F-090-31).
+        let pool_bundle = edgequake_storage::PgPoolBundle::connect(&database_url).await?;
+        let pool = pool_bundle.ingest.clone();
+        let admin_pool = pool_bundle.admin.clone();
+        let queue_pool = pool_bundle.queue.clone();
+        let query_pool = pool_bundle.query.clone();
+        let _db_pool_size = pool_bundle.total_max_connections();
         let pg_config = edgequake_storage::adapters::postgres::PostgresConfig::new(
             host, port, database, user, password,
         )
         .with_namespace("default")
-        .with_max_connections(db_pool_size);
-
-        // Create PostgreSQL connection pool for conversation service.
-        //
-        // WHY after_connect sets search_path=public:
-        // Migration 001 creates the 'edgequake' schema. After that, PostgreSQL's
-        // default search_path "$user",public resolves "$user"="edgequake" to that
-        // schema first. Without this, SQLx finds no _sqlx_migrations in edgequake
-        // (it's in public), creates a fresh empty one, thinks all migrations are
-        // unapplied, then tries to re-insert version=1 into public._sqlx_migrations
-        // which already exists → "duplicate key value violates unique constraint
-        // _sqlx_migrations_pkey" → panic on every restart.
-        // Using after_connect guarantees ALL pool connections always use public,
-        // so _sqlx_migrations is consistently read/written in the correct schema.
-        //
-        // acquire_timeout(5s): fail fast instead of queuing 30s — callers get
-        // a quick 500 and back off, rather than stacking up 30s waiters.
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(db_pool_size)
-            .acquire_timeout(std::time::Duration::from_secs(5))
-            .after_connect(|conn, _| {
-                Box::pin(async move {
-                    sqlx::query("SET search_path TO public")
-                        .execute(conn)
-                        .await
-                        .map(|_| ())
-                })
-            })
-            .connect(&database_url)
-            .await?;
+        .with_max_connections(pool_bundle.ingest_max);
 
         // Ensure required extensions are available (these should be created in Docker init.sql,
         // but we check and log if they're missing)
@@ -195,7 +162,7 @@ impl AppState {
         let extensions_result = sqlx::query_scalar::<_, String>(
             "SELECT extname FROM pg_extension WHERE extname IN ('vector', 'uuid-ossp')",
         )
-        .fetch_all(&pool)
+        .fetch_all(&admin_pool)
         .await;
 
         match extensions_result {
@@ -231,14 +198,20 @@ impl AppState {
             }
         }
 
-        // SPEC-006: migration bootstrap with progression logs + migration 038 verify/repair
+        // SPEC-006 / SPEC-090: migrations + reconcile on **admin** pool only.
+        // Serving boot is verify-only unless EDGEQUAKE_ALLOW_BOOT_MIGRATE=1.
         let migration_bootstrap =
-            super::migration_bootstrap::run_postgres_migrations(&pool).await?;
+            super::migration_bootstrap::bootstrap_for_serving(&admin_pool).await?;
+
+        // SPEC-090 F-090-32: HNSW shape manifest drift (log + metric).
+        if let Err(e) = edgequake_storage::check_hnsw_index_manifest(&admin_pool).await {
+            tracing::warn!(error = %e, "SPEC-090: HNSW index manifest check failed");
+        }
 
         let age_extversion = migration_bootstrap.migration_043.extversion_after.clone();
         let postgres_capabilities =
             edgequake_storage::adapters::postgres::PostgresCapabilities::detect(
-                &pool,
+                &admin_pool,
                 age_extversion,
             )
             .await;
@@ -259,16 +232,29 @@ impl AppState {
             std::env::var("EDGEQUAKE_LLM_PROVIDER").unwrap_or_else(|_| "auto-detected".to_string())
         );
 
-        // Create PostgreSQL-backed storages (SPEC-011: single shared pool)
+        // SPEC-090: ingest pool for writes; query pool for QueryEngine reads.
         use edgequake_storage::adapters::postgres::PostgresPool;
         use edgequake_storage::{DimensionEnsureOutcome, DimensionReconcilePolicy};
-        let storage_pool = PostgresPool::from_existing(pool.clone(), pg_config.clone());
+        let ingest_pool = PostgresPool::from_existing(pool.clone(), pg_config.clone());
+        let query_pg = {
+            let mut c = pg_config.clone();
+            c.max_connections = pool_bundle.query_max;
+            PostgresPool::from_existing(query_pool.clone(), c)
+        };
         let kv_storage = Arc::new(PostgresKVStorage::with_pool(
-            storage_pool.clone(),
+            ingest_pool.clone(),
             pg_config.clone(),
         ));
         let graph_storage = Arc::new(PostgresAGEGraphStorage::with_pool(
-            storage_pool.clone(),
+            ingest_pool.clone(),
+            pg_config.clone(),
+        ));
+        let kv_query = Arc::new(PostgresKVStorage::with_pool(
+            query_pg.clone(),
+            pg_config.clone(),
+        ));
+        let graph_query = Arc::new(PostgresAGEGraphStorage::with_pool(
+            query_pg.clone(),
             pg_config.clone(),
         ));
 
@@ -278,7 +264,7 @@ impl AppState {
         //   rebind default vector storage to stored dim (PreferExisting).
         // - New workspaces still use provider `embedding_dim` via registry.
         let provisional = PgVectorStorage::with_pool_and_dimension(
-            storage_pool.clone(),
+            ingest_pool.clone(),
             pg_config.clone(),
             embedding_dim,
         );
@@ -300,7 +286,7 @@ impl AppState {
                 );
                 (
                     Arc::new(PgVectorStorage::with_pool_and_dimension(
-                        storage_pool.clone(),
+                        ingest_pool.clone(),
                         pg_config.clone(),
                         stored,
                     )),
@@ -308,6 +294,11 @@ impl AppState {
                 )
             }
         };
+        let vector_query = Arc::new(PgVectorStorage::with_pool_and_dimension(
+            query_pg.clone(),
+            pg_config.clone(),
+            vector_storage.dimension(),
+        ));
         if recreated {
             tracing::warn!(
                 dimension = embedding_dim,
@@ -326,17 +317,25 @@ impl AppState {
         // Initialize storage backends to establish connections
         kv_storage.initialize().await?;
         vector_storage.initialize().await?;
-        // WHY: Apache AGE (graph extension) may not be available in all PostgreSQL deployments
-        // (e.g., pgvector-only images used in CI). Graph storage failure is non-fatal;
-        // graph-dependent features (entity extraction, Cypher queries) will degrade gracefully
-        // by returning errors, while the server continues to serve all other endpoints.
+        // SPEC-090 F-090-19: fail-closed on graph init unless EDGEQUAKE_ALLOW_NO_GRAPH=1.
         if let Err(e) = graph_storage.initialize().await {
-            tracing::warn!(
-                "⚠ Graph storage (Apache AGE) not available: {} \
-                - graph features will be degraded. \
-                Install Apache AGE extension for full functionality.",
-                e
-            );
+            let allow = std::env::var("EDGEQUAKE_ALLOW_NO_GRAPH")
+                .ok()
+                .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false);
+            if allow {
+                tracing::warn!(
+                    "Graph storage (Apache AGE) not available: {} \
+                     — continuing with EDGEQUAKE_ALLOW_NO_GRAPH=1",
+                    e
+                );
+            } else {
+                return Err(format!(
+                    "Graph storage (Apache AGE) initialize failed: {e}. \
+                     Set EDGEQUAKE_ALLOW_NO_GRAPH=1 to start without graph storage."
+                )
+                .into());
+            }
         } else {
             edgequake_storage::spawn_community_backfill_if_needed(
                 Arc::clone(&graph_storage) as Arc<dyn edgequake_storage::traits::GraphStorage>
@@ -377,24 +376,24 @@ impl AppState {
         // WHY: Tasks must persist across backend restarts so cancel/retry work correctly.
         // Previous bug: MemoryTaskStorage was used, causing tasks to be lost on restart.
         let task_storage: edgequake_tasks::SharedTaskStorage = Arc::new(
-            edgequake_tasks::postgres::PostgresTaskStorage::new(pool.clone()),
+            edgequake_tasks::postgres::PostgresTaskStorage::new(queue_pool.clone()),
         );
         let task_queue = Arc::new(edgequake_tasks::queue::ChannelTaskQueue::new(100));
-        tracing::info!("✓ Task storage: PostgreSQL (persistent across restarts)");
+        tracing::info!("✓ Task storage: PostgreSQL queue pool (SPEC-090 F-090-28)");
 
         let engine_impl = super::query_bootstrap::build_production_query_engine(
-            Arc::clone(&vector_storage) as Arc<dyn edgequake_storage::traits::VectorStorage>,
-            Arc::clone(&graph_storage) as Arc<dyn edgequake_storage::traits::GraphStorage>,
+            Arc::clone(&vector_query) as Arc<dyn edgequake_storage::traits::VectorStorage>,
+            Arc::clone(&graph_query) as Arc<dyn edgequake_storage::traits::GraphStorage>,
             Arc::clone(&embedding_provider),
             Arc::clone(&llm_provider) as Arc<dyn edgequake_llm::traits::LLMProvider>,
-            Arc::clone(&kv_storage) as Arc<dyn edgequake_storage::traits::KVStorage>,
+            Arc::clone(&kv_query) as Arc<dyn edgequake_storage::traits::KVStorage>,
         );
 
-        // Create workspace vector registry for per-workspace dimensions
+        // Create workspace vector registry for per-workspace dimensions (ingest pool)
         let vector_registry: Arc<dyn edgequake_storage::traits::WorkspaceVectorRegistry> =
             Arc::new(PgWorkspaceVectorRegistry::new(
                 pg_config,
-                storage_pool.clone(),
+                ingest_pool.clone(),
                 Arc::clone(&vector_storage) as Arc<dyn edgequake_storage::traits::VectorStorage>,
                 embedding_dim,
             ));
@@ -440,10 +439,7 @@ impl AppState {
         let (resource_guard, graph_materialize, pdf_vision, read_path_db) =
             super::resource_runtime::build_resource_runtime();
 
-        let configured_pool_size: usize = std::env::var("DATABASE_POOL_SIZE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(32);
+        let configured_pool_size = pool_bundle.total_max_connections() as usize;
         crate::read_path::warn_if_local_pool_oversized(configured_pool_size, llm_provider.name());
 
         let app_state = Self {
@@ -466,6 +462,7 @@ impl AppState {
             cache_manager: CacheManager::with_defaults(),
             rate_limiter: RateLimiter::new(TokenBucketConfig::default()),
             pg_pool: Some(pool.clone()),
+            pool_bundle: Some(pool_bundle),
             start_time: std::time::Instant::now(),
             path_validation_config: Self::load_path_validation_config(),
             audit_logger: Some(audit_logger),
@@ -480,7 +477,7 @@ impl AppState {
         };
 
         // SPEC-043: load server_config LLM defaults into process-wide overrides
-        if let Err(e) = app_state.server_config.load_from_pool(&pool).await {
+        if let Err(e) = app_state.server_config.load_from_pool(&admin_pool).await {
             tracing::warn!(error = %e, "Failed to load server_config LLM defaults at startup");
         } else {
             tracing::info!("Loaded server_config LLM defaults and app attribution (SPEC-043)");
@@ -491,7 +488,7 @@ impl AppState {
         {
             use crate::storage_inspector::{InspectorConfig, StorageInspector};
             let inspector =
-                StorageInspector::new(Arc::new(pool.clone()), InspectorConfig::default());
+                StorageInspector::new(Arc::new(admin_pool.clone()), InspectorConfig::default());
             let report = inspector.inspect().await;
             if report.has_critical {
                 tracing::error!(

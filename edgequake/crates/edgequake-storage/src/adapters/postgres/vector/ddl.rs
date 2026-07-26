@@ -24,11 +24,20 @@ fn sanitize_pg_setting(raw: &str, fallback: &str) -> String {
 }
 
 impl PgVectorStorage {
-    /// SPEC-070: DDL-only session GUCs for index builds (never apply query timeout).
+    /// SPEC-070 / SPEC-090 F-090-07: DDL session GUCs for index builds.
     ///
-    /// July 2026 pgvector practice: `statement_timeout=0`, short `lock_timeout`,
-    /// elevated `maintenance_work_mem` on the **build connection only**.
+    /// Prefer `SET LOCAL` inside an open transaction. `CREATE INDEX CONCURRENTLY`
+    /// cannot run in a TX, so that path uses session `SET` on a dedicated
+    /// connection that is `DISCARD ALL`'d on pool release.
     pub(crate) async fn setup_vector_ddl_session(conn: &mut sqlx::PgConnection) -> Result<()> {
+        Self::apply_vector_ddl_gucs(conn, false).await
+    }
+
+    /// Apply DDL GUCs; `local=true` requires an open transaction (`SET LOCAL`).
+    pub(crate) async fn apply_vector_ddl_gucs(
+        conn: &mut sqlx::PgConnection,
+        local: bool,
+    ) -> Result<()> {
         let lock_timeout = sanitize_pg_setting(
             &std::env::var("EDGEQUAKE_GRAPH_DDL_LOCK_TIMEOUT").unwrap_or_default(),
             "5s",
@@ -37,7 +46,8 @@ impl PgVectorStorage {
             &std::env::var("EDGEQUAKE_INDEX_MAINTENANCE_WORK_MEM").unwrap_or_default(),
             "256MB",
         );
-        sqlx::query("SET statement_timeout = 0")
+        let set = if local { "SET LOCAL" } else { "SET" };
+        sqlx::query(&format!("{set} statement_timeout = 0"))
             .execute(&mut *conn)
             .await
             .map_err(|e| {
@@ -45,13 +55,13 @@ impl PgVectorStorage {
                     "Failed to clear statement_timeout for vector DDL: {e}"
                 ))
             })?;
-        sqlx::query(&format!("SET lock_timeout = '{lock_timeout}'"))
+        sqlx::query(&format!("{set} lock_timeout = '{lock_timeout}'"))
             .execute(&mut *conn)
             .await
             .map_err(|e| {
                 StorageError::Database(format!("Failed to set vector DDL lock_timeout: {e}"))
             })?;
-        sqlx::query(&format!("SET maintenance_work_mem = '{maint_mem}'"))
+        sqlx::query(&format!("{set} maintenance_work_mem = '{maint_mem}'"))
             .execute(&mut *conn)
             .await
             .map_err(|e| {
@@ -63,16 +73,121 @@ impl PgVectorStorage {
     }
 
     /// Run index/DDL SQL on a dedicated connection with vector DDL session GUCs.
+    ///
+    /// SPEC-090 F-090-08: non-empty tables use `CREATE INDEX CONCURRENTLY` outside
+    /// a transaction; empty tables may use blocking `CREATE INDEX`. INVALID leftovers
+    /// from interrupted builds are dropped before retry.
     async fn execute_index_ddl(pool: &sqlx::PgPool, sql: &str) -> Result<()> {
-        let mut conn = pool.acquire().await.map_err(|e| {
-            StorageError::Connection(format!("Failed to acquire connection for vector DDL: {e}"))
+        let (index_name, table_name) = parse_create_index_target(sql).ok_or_else(|| {
+            StorageError::Database(format!("Cannot parse vector index DDL: {sql}"))
         })?;
-        Self::setup_vector_ddl_session(&mut conn).await?;
-        sqlx::query(sql)
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| StorageError::Database(format!("Vector index DDL failed: {e}")))?;
+        let table_only = table_name
+            .split('.')
+            .next_back()
+            .unwrap_or(table_name)
+            .trim_matches('"');
+
+        let index_state = Self::vector_index_validity(pool, index_name).await;
+        match index_state {
+            Some(true) => {
+                tracing::debug!(index = %index_name, "Vector index already valid, skip");
+                return Ok(());
+            }
+            Some(false) => {
+                tracing::warn!(
+                    index = %index_name,
+                    table = %table_name,
+                    "Vector index INVALID (interrupted build), dropping before rebuild"
+                );
+                let mut conn = pool.acquire().await.map_err(|e| {
+                    StorageError::Connection(format!(
+                        "Failed to acquire connection for INVALID index drop: {e}"
+                    ))
+                })?;
+                Self::setup_vector_ddl_session(&mut conn).await?;
+                let drop_sql = format!("DROP INDEX CONCURRENTLY IF EXISTS {index_name}");
+                if let Err(e) = sqlx::query(&drop_sql).execute(&mut *conn).await {
+                    tracing::warn!(
+                        index = %index_name,
+                        error = %e,
+                        "Failed to drop INVALID vector index"
+                    );
+                    return Err(StorageError::Database(format!(
+                        "Failed to drop INVALID vector index {index_name}: {e}"
+                    )));
+                }
+            }
+            None => {}
+        }
+
+        let row_estimate = Self::table_row_estimate(pool, table_only).await?;
+        let use_concurrent = row_estimate > 0;
+        let final_sql = if use_concurrent {
+            sql.replace(
+                "CREATE INDEX IF NOT EXISTS",
+                "CREATE INDEX CONCURRENTLY IF NOT EXISTS",
+            )
+        } else {
+            sql.to_string()
+        };
+
+        if use_concurrent {
+            // CIC cannot run inside a transaction — session SET + DISCARD ALL on release.
+            let mut conn = pool.acquire().await.map_err(|e| {
+                StorageError::Connection(format!(
+                    "Failed to acquire connection for vector DDL: {e}"
+                ))
+            })?;
+            Self::apply_vector_ddl_gucs(&mut conn, false).await?;
+            sqlx::query(&final_sql)
+                .execute(&mut *conn)
+                .await
+                .map_err(|e| StorageError::Database(format!("Vector index DDL failed: {e}")))?;
+        } else {
+            let mut tx = pool.begin().await.map_err(|e| {
+                StorageError::Connection(format!("Failed to begin TX for vector DDL: {e}"))
+            })?;
+            Self::apply_vector_ddl_gucs(&mut tx, true).await?;
+            sqlx::query(&final_sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| StorageError::Database(format!("Vector index DDL failed: {e}")))?;
+            tx.commit()
+                .await
+                .map_err(|e| StorageError::Database(format!("Vector DDL commit failed: {e}")))?;
+        }
         Ok(())
+    }
+
+    /// `Some(true)` = valid index, `Some(false)` = INVALID, `None` = missing.
+    async fn vector_index_validity(pool: &sqlx::PgPool, index_name: &str) -> Option<bool> {
+        sqlx::query_scalar(
+            "SELECT i.indisvalid FROM pg_index i
+             JOIN pg_class c ON c.oid = i.indexrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relname = $1 AND n.nspname = 'public'",
+        )
+        .bind(index_name)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Estimated row count from pg_class (0 for empty / new tables).
+    async fn table_row_estimate(pool: &sqlx::PgPool, table_name: &str) -> Result<i64> {
+        let estimate: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(c.reltuples::bigint, 0)
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public' AND c.relname = $1",
+        )
+        .bind(table_name)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| StorageError::Database(format!("table_row_estimate failed: {e}")))?
+        .unwrap_or(0);
+        Ok(estimate.max(0))
     }
     /// Create the vectors table and indexes.
     pub(crate) async fn create_table(&self) -> Result<()> {
@@ -153,9 +268,17 @@ impl PgVectorStorage {
             r#"
             ALTER TABLE {} ADD COLUMN IF NOT EXISTS document_id TEXT;
             ALTER TABLE {} ADD COLUMN IF NOT EXISTS tenant_id TEXT;
-            ALTER TABLE {} ADD COLUMN IF NOT EXISTS workspace_id TEXT
+            ALTER TABLE {} ADD COLUMN IF NOT EXISTS workspace_id TEXT;
+            ALTER TABLE {} ADD COLUMN IF NOT EXISTS embedding_model TEXT;
+            ALTER TABLE {} ADD COLUMN IF NOT EXISTS embedding_dim INT;
+            ALTER TABLE {} ADD COLUMN IF NOT EXISTS embedding_norm TEXT
             "#,
-            self.table_name, self.table_name, self.table_name
+            self.table_name,
+            self.table_name,
+            self.table_name,
+            self.table_name,
+            self.table_name,
+            self.table_name
         );
         for stmt in add_cols.split(';').filter(|s| !s.trim().is_empty()) {
             sqlx::query(stmt.trim()).execute(&pool).await.ok();
@@ -403,7 +526,9 @@ impl PgVectorStorage {
     /// SPEC-065: productized Wave-2 path — create partial HNSW for a hot workspace
     /// when opt-in is on, table is shared (multi-WS), and row count ≥ threshold.
     ///
-    /// Dedicated per-workspace tables are a no-op (already isolated). Keeps global HNSW.
+    /// Dedicated per-workspace tables are a no-op (already isolated by table).
+    /// Mutual exclusivity: shared tables use partial OR global HNSW per workspace —
+    /// when partial exists, query path prefers partial only (no dual-index writes).
     pub async fn ensure_hot_workspace_ann(&self, workspace_id: &str) -> Result<bool> {
         let runtime = HnswRuntimePolicy::from_env();
         if !runtime.partial_by_workspace {
@@ -446,7 +571,91 @@ impl PgVectorStorage {
                 "ensure_hot_workspace_ann: partial HNSW missing after CREATE for workspace {workspace_id}"
             )));
         }
+        // SPEC-090 F-090-25: register hot WS and exclude it from the global HNSW.
+        self.register_hot_ann_workspace(workspace_id).await?;
+        self.rebuild_global_ann_excluding_hot_workspaces().await?;
         Ok(true)
+    }
+
+    /// Record workspace as mutual-exclusive with the global HNSW (F-090-25).
+    async fn register_hot_ann_workspace(&self, workspace_id: &str) -> Result<()> {
+        let pool = self.pool.get().await?;
+        let _ = sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS eq_hot_ann_workspaces (
+              table_prefix TEXT NOT NULL,
+              workspace_id TEXT NOT NULL,
+              created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+              PRIMARY KEY (table_prefix, workspace_id)
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await;
+        sqlx::query(
+            r#"
+            INSERT INTO eq_hot_ann_workspaces (table_prefix, workspace_id)
+            VALUES ($1, $2)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(&self.prefix)
+        .bind(workspace_id)
+        .execute(&pool)
+        .await
+        .map_err(|e| StorageError::Database(format!("register_hot_ann_workspace failed: {e}")))?;
+        Ok(())
+    }
+
+    /// Rebuild global HNSW as `WHERE workspace_id NOT IN (hot set)` (F-090-25).
+    async fn rebuild_global_ann_excluding_hot_workspaces(&self) -> Result<()> {
+        let pool = self.pool.get().await?;
+        let policy = AnnIndexPolicy::resolve(self.dimension, self.storage_mode);
+        if !policy.hnsw_viable {
+            return Ok(());
+        }
+        let hot: Vec<String> = sqlx::query_scalar(
+            "SELECT workspace_id FROM eq_hot_ann_workspaces WHERE table_prefix = $1",
+        )
+        .bind(&self.prefix)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
+        if hot.is_empty() {
+            return Ok(());
+        }
+        let global = self.ann_index_name();
+        // Drop then recreate with exclusion predicate (CIC path via execute_index_ddl).
+        let drop_sql = format!("DROP INDEX CONCURRENTLY IF EXISTS {global}");
+        let mut conn = pool.acquire().await.map_err(|e| {
+            StorageError::Connection(format!("acquire for global HNSW rebuild: {e}"))
+        })?;
+        Self::apply_vector_ddl_gucs(&mut conn, false).await?;
+        let _ = sqlx::query(&drop_sql).execute(&mut *conn).await;
+        drop(conn);
+
+        let opclass = self.embedding_opclass();
+        let lit_list: Vec<String> = hot.iter().map(|w| sql_string_literal(w)).collect();
+        let not_in = lit_list.join(", ");
+        let index_sql = format!(
+            "CREATE INDEX IF NOT EXISTS {global} ON {} USING hnsw (embedding {}) \
+             WITH (m = {}, ef_construction = {}) \
+             WHERE workspace_id IS NULL OR workspace_id NOT IN ({not_in})",
+            self.table_name, opclass, self.hnsw_m, self.hnsw_ef_construction
+        );
+        Self::execute_index_ddl(&pool, &index_sql)
+            .await
+            .map_err(|e| {
+                StorageError::Database(format!(
+                    "rebuild global HNSW excluding hot workspaces failed: {e}"
+                ))
+            })?;
+        tracing::info!(
+            table = %self.table_name,
+            hot_workspaces = hot.len(),
+            "SPEC-090: global HNSW rebuilt excluding hot workspaces (mutual exclusive)"
+        );
+        Ok(())
     }
 
     /// Count vector tables that have no HNSW/IVFFlat index (bootstrap readiness).
@@ -529,6 +738,14 @@ impl PgVectorStorage {
 
         Ok(())
     }
+}
+
+/// Parse `CREATE INDEX IF NOT EXISTS {name} ON {table} ...` for F-090-08 routing.
+fn parse_create_index_target(sql: &str) -> Option<(&str, &str)> {
+    let rest = sql.trim().strip_prefix("CREATE INDEX IF NOT EXISTS ")?;
+    let (index_name, rest) = rest.split_once(" ON ")?;
+    let table = rest.split_whitespace().next()?;
+    Some((index_name.trim(), table.trim()))
 }
 
 /// Stable, index-safe slug for workspace_id (alnum/_ + short hash).

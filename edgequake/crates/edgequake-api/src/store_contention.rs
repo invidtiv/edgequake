@@ -82,6 +82,45 @@ pub fn pool_utilization(size: u32, idle: u32) -> Option<f64> {
     Some(active as f64 / size as f64)
 }
 
+/// Per-role pool utilization snapshot (SPEC-090 F-090-28).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolePoolUtilization {
+    pub role: &'static str,
+    pub size: u32,
+    pub idle: u32,
+    pub utilization: Option<f64>,
+}
+
+/// Max utilization across role pools (readiness uses the hottest role).
+pub fn max_role_pool_utilization(roles: &[RolePoolUtilization]) -> Option<f64> {
+    roles.iter().filter_map(|r| r.utilization).reduce(f64::max)
+}
+
+/// Build role util rows from a [`edgequake_storage::PgPoolBundle`].
+#[cfg(feature = "postgres")]
+pub fn role_utils_from_bundle(
+    bundle: &edgequake_storage::PgPoolBundle,
+) -> Vec<RolePoolUtilization> {
+    [
+        ("query", &bundle.query),
+        ("ingest", &bundle.ingest),
+        ("queue", &bundle.queue),
+        ("admin", &bundle.admin),
+    ]
+    .into_iter()
+    .map(|(role, pool)| {
+        let size = pool.size();
+        let idle = pool.num_idle().min(u32::MAX as usize) as u32;
+        RolePoolUtilization {
+            role,
+            size,
+            idle,
+            utilization: pool_utilization(size, idle),
+        }
+    })
+    .collect()
+}
+
 /// Assess store contention from pool util + quarantine totals.
 pub fn assess_store_contention(db_pool_utilization: Option<f64>) -> StoreContentionSnapshot {
     let util_warn = db_pool_util_warn_threshold();

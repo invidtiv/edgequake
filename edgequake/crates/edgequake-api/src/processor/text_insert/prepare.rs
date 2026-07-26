@@ -305,7 +305,8 @@ impl DocumentTaskProcessor {
         );
 
         // Update task progress - chunking
-        task.update_progress("chunking".to_string(), 4, 10);
+        self.bump_task_progress(task, "chunking".to_string(), 4, 10)
+            .await;
 
         // Log to pipeline state
         self.pipeline_state

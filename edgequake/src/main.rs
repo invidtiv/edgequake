@@ -2,6 +2,8 @@
 //!
 //! This is the main entry point for the EdgeQuake server.
 
+mod migrate_console;
+
 use anyhow::{Context, Result};
 use chrono::{Duration, Utc};
 use edgequake_api::startup_security::{enforce_startup_security, validate_startup_security};
@@ -541,6 +543,82 @@ async fn periodic_orphan_check(
     Ok(())
 }
 
+/// SPEC-090 F-090-20b: apply sqlx migrations + support reconcile on an admin pool.
+#[cfg(feature = "postgres")]
+async fn run_migrate_cli() -> Result<()> {
+    // SAFETY: process-local flag for migrate CLI path; set before any bootstrap work.
+    std::env::set_var("EDGEQUAKE_MIGRATE_CLI", "1");
+    let database_url =
+        std::env::var("DATABASE_URL").context("DATABASE_URL required for `edgequake migrate`")?;
+    let redacted = redact_database_url(&database_url);
+    migrate_console::print_banner(env!("CARGO_PKG_VERSION"), &redacted);
+    info!(database = %redacted, "edgequake migrate: connecting admin pool");
+
+    let bundle = match edgequake_storage::PgPoolBundle::connect(&database_url).await {
+        Ok(b) => b,
+        Err(e) => {
+            migrate_console::print_failure_hint(&e);
+            return Err(e).context("PgPoolBundle connect failed");
+        }
+    };
+
+    let pending =
+        match edgequake_api::state::migration_bootstrap::list_pending_migrations(&bundle.admin)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                migrate_console::print_failure_hint(&e);
+                return Err(e).context("list pending migrations failed");
+            }
+        };
+    migrate_console::print_preflight(&pending);
+    println!("applying migrations + support reconcile on admin pool…");
+
+    let report =
+        match edgequake_api::state::migration_bootstrap::run_postgres_migrations(&bundle.admin)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                migrate_console::print_failure_hint(&e);
+                return Err(e).context("migrate failed");
+            }
+        };
+
+    let applied: Vec<(i64, String)> = report
+        .applied_versions
+        .iter()
+        .copied()
+        .map(|v| {
+            (
+                v,
+                edgequake_api::state::migration_bootstrap::migration_description(v),
+            )
+        })
+        .collect();
+    migrate_console::print_applied_this_run(&applied);
+    migrate_console::print_post_hooks(&bundle.admin).await;
+
+    info!(
+        pending_before = report.pending_before,
+        latest = ?report.latest_version,
+        applied = report.applied_versions.len(),
+        "edgequake migrate complete"
+    );
+    migrate_console::print_summary(
+        report.pending_before,
+        report.latest_version,
+        report.applied_versions.len(),
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn run_migrate_cli() -> Result<()> {
+    anyhow::bail!("`edgequake migrate` requires the postgres feature")
+}
+
 fn main() -> Result<()> {
     // WHY 8 MiB: Hybrid/Mix join three large retrieval futures. Debug builds still
     // need headroom even after Box::pin (SPEC-047 stack overflow). Override via
@@ -559,6 +637,12 @@ fn main() -> Result<()> {
 
 async fn async_main() -> Result<()> {
     let _obs_guard = init_observability(ObservabilityConfig::from_env());
+
+    // SPEC-090 F-090-20b: `edgequake migrate` — admin-pool migrate + reconcile ledger.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("migrate") {
+        return run_migrate_cli().await;
+    }
 
     info!("Starting EdgeQuake v{}", env!("CARGO_PKG_VERSION"));
 

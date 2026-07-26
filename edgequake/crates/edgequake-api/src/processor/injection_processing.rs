@@ -16,7 +16,8 @@ impl DocumentTaskProcessor {
         self.check_cancelled(&cancel_token, "pre-injection", &data.injection_id)
             .await?;
 
-        task.update_progress("processing".to_string(), 1, 10);
+        self.bump_task_progress(task, "processing".to_string(), 1, 10)
+            .await;
 
         let workspace_id = if data.workspace_id.is_empty() || data.workspace_id == "default" {
             None
@@ -45,7 +46,8 @@ impl DocumentTaskProcessor {
         self.check_cancelled(&cancel_token, "pre-pipeline", &data.injection_id)
             .await?;
 
-        task.update_progress("extracting".to_string(), 3, 40);
+        self.bump_task_progress(task, "extracting".to_string(), 3, 40)
+            .await;
 
         let lineage = self
             .get_workspace_provider_lineage(Some(data.workspace_id.as_str()))
@@ -117,7 +119,8 @@ impl DocumentTaskProcessor {
                     entity_count,
                     "Injection processing completed"
                 );
-                task.update_progress("completed".to_string(), 1, 100);
+                self.bump_task_progress(task, "completed".to_string(), 1, 100)
+                    .await;
                 Ok(json!({
                     "injection_id": data.injection_id,
                     "entity_count": entity_count,

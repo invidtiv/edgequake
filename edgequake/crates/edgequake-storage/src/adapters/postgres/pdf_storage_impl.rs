@@ -4,7 +4,8 @@
 //! @implements BR0701: Workspace isolation via RLS
 
 use async_trait::async_trait;
-use sqlx::PgPool;
+use chrono::{DateTime, Utc};
+use sqlx::{PgPool, Row};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -150,6 +151,81 @@ impl PostgresPdfStorage {
 
         Ok(())
     }
+
+    /// SPEC-090 F-090-16: load metadata + bytes from `pdf_document_blobs` (fail if blob missing).
+    async fn fetch_pdf_row(
+        &self,
+        where_sql: &str,
+        bind_pdf_id: Option<&Uuid>,
+        bind_workspace: Option<&Uuid>,
+        bind_checksum: Option<&str>,
+    ) -> Result<Option<PdfDocument>> {
+        let sql = format!(
+            r#"
+            SELECT
+                d.pdf_id,
+                d.workspace_id,
+                d.document_id,
+                d.filename,
+                d.content_type,
+                d.file_size_bytes,
+                d.sha256_checksum,
+                d.page_count,
+                b.pdf_data AS pdf_data,
+                d.processing_status,
+                d.extraction_method,
+                d.vision_model,
+                d.markdown_content,
+                d.extraction_errors,
+                d.created_at,
+                d.processed_at,
+                d.updated_at
+            FROM pdf_documents d
+            INNER JOIN pdf_document_blobs b ON b.pdf_id = d.pdf_id
+            {where_sql}
+            LIMIT 1
+            "#
+        );
+        let mut q = sqlx::query(&sql);
+        if let Some(id) = bind_pdf_id {
+            q = q.bind(id);
+        }
+        if let Some(ws) = bind_workspace {
+            q = q.bind(ws);
+        }
+        if let Some(cs) = bind_checksum {
+            q = q.bind(cs);
+        }
+        let row = q
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| StorageError::Database(format!("Failed to fetch PDF: {e}")))?;
+        Ok(row.map(|r| PdfDocument {
+            pdf_id: r.get("pdf_id"),
+            workspace_id: r.get("workspace_id"),
+            document_id: r.get("document_id"),
+            filename: r.get("filename"),
+            content_type: r.get("content_type"),
+            file_size_bytes: r.get("file_size_bytes"),
+            sha256_checksum: r.get("sha256_checksum"),
+            page_count: r.get("page_count"),
+            pdf_data: r.get("pdf_data"),
+            processing_status: r
+                .get::<String, _>("processing_status")
+                .parse()
+                .unwrap_or(PdfProcessingStatus::Pending),
+            extraction_method: r
+                .get::<Option<String>, _>("extraction_method")
+                .as_ref()
+                .and_then(|m| m.parse().ok()),
+            vision_model: r.get("vision_model"),
+            markdown_content: r.get("markdown_content"),
+            extraction_errors: r.get("extraction_errors"),
+            created_at: r.get::<DateTime<Utc>, _>("created_at"),
+            processed_at: r.get("processed_at"),
+            updated_at: r.get::<DateTime<Utc>, _>("updated_at"),
+        }))
+    }
 }
 
 #[async_trait]
@@ -173,10 +249,13 @@ impl PdfDocumentStorage for PostgresPdfStorage {
             )));
         }
 
-        // Insert PDF
+        // SPEC-090 F-090-16: metadata row + blob side-table (SSOT for bytes) in one TX.
         let pdf_id = Uuid::new_v4();
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            StorageError::Database(format!("Failed to begin PDF create transaction: {e}"))
+        })?;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO pdf_documents (
                 pdf_id,
@@ -186,23 +265,21 @@ impl PdfDocumentStorage for PostgresPdfStorage {
                 file_size_bytes,
                 sha256_checksum,
                 page_count,
-                pdf_data,
                 processing_status,
                 vision_model
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             "#,
-            pdf_id,
-            request.workspace_id,
-            request.filename,
-            request.content_type,
-            request.file_size_bytes,
-            request.sha256_checksum,
-            request.page_count,
-            request.pdf_data,
-            PdfProcessingStatus::Pending.as_str(),
-            request.vision_model,
         )
-        .execute(&self.pool)
+        .bind(pdf_id)
+        .bind(request.workspace_id)
+        .bind(&request.filename)
+        .bind(&request.content_type)
+        .bind(request.file_size_bytes)
+        .bind(&request.sha256_checksum)
+        .bind(request.page_count)
+        .bind(PdfProcessingStatus::Pending.as_str())
+        .bind(&request.vision_model)
+        .execute(&mut *tx)
         .await
         .map_err(|e| {
             // FIX-DUPLICATE-BUG: Convert unique constraint violation to Conflict error.
@@ -221,6 +298,29 @@ impl PdfDocumentStorage for PostgresPdfStorage {
             StorageError::Database(format!("Failed to create PDF document: {}", e))
         })?;
 
+        sqlx::query(
+            r#"
+            INSERT INTO pdf_document_blobs (pdf_id, pdf_data)
+            VALUES ($1, $2)
+            ON CONFLICT (pdf_id) DO UPDATE SET
+                pdf_data = EXCLUDED.pdf_data,
+                updated_at = NOW()
+            "#,
+        )
+        .bind(pdf_id)
+        .bind(&request.pdf_data)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            StorageError::Database(format!(
+                "Failed to write pdf_document_blobs for {pdf_id}: {e}"
+            ))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            StorageError::Database(format!("Failed to commit PDF create transaction: {e}"))
+        })?;
+
         debug!(
             "Created PDF document: id={}, workspace={}, size={}",
             pdf_id, request.workspace_id, request.file_size_bytes
@@ -230,54 +330,8 @@ impl PdfDocumentStorage for PostgresPdfStorage {
     }
 
     async fn get_pdf(&self, pdf_id: &Uuid) -> Result<Option<PdfDocument>> {
-        let row = sqlx::query!(
-            r#"
-            SELECT
-                pdf_id,
-                workspace_id,
-                document_id,
-                filename,
-                content_type,
-                file_size_bytes,
-                sha256_checksum,
-                page_count,
-                pdf_data,
-                processing_status,
-                extraction_method,
-                vision_model,
-                markdown_content,
-                extraction_errors,
-                created_at,
-                processed_at,
-                updated_at
-            FROM pdf_documents
-            WHERE pdf_id = $1
-            "#,
-            pdf_id
-        )
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| StorageError::Database(format!("Failed to get PDF: {}", e)))?;
-
-        Ok(row.map(|r| PdfDocument {
-            pdf_id: r.pdf_id,
-            workspace_id: r.workspace_id,
-            document_id: r.document_id,
-            filename: r.filename,
-            content_type: r.content_type,
-            file_size_bytes: r.file_size_bytes,
-            sha256_checksum: r.sha256_checksum,
-            page_count: r.page_count,
-            pdf_data: r.pdf_data,
-            processing_status: r.processing_status.parse().unwrap(),
-            extraction_method: r.extraction_method.as_ref().and_then(|m| m.parse().ok()),
-            vision_model: r.vision_model,
-            markdown_content: r.markdown_content,
-            extraction_errors: r.extraction_errors,
-            created_at: r.created_at,
-            processed_at: r.processed_at,
-            updated_at: r.updated_at,
-        }))
+        self.fetch_pdf_row("WHERE d.pdf_id = $1", Some(pdf_id), None, None)
+            .await
     }
 
     async fn find_pdf_by_checksum(
@@ -285,56 +339,13 @@ impl PdfDocumentStorage for PostgresPdfStorage {
         workspace_id: &Uuid,
         checksum: &str,
     ) -> Result<Option<PdfDocument>> {
-        let row = sqlx::query!(
-            r#"
-            SELECT
-                pdf_id,
-                workspace_id,
-                document_id,
-                filename,
-                content_type,
-                file_size_bytes,
-                sha256_checksum,
-                page_count,
-                pdf_data,
-                processing_status,
-                extraction_method,
-                vision_model,
-                markdown_content,
-                extraction_errors,
-                created_at,
-                processed_at,
-                updated_at
-            FROM pdf_documents
-            WHERE workspace_id = $1 AND sha256_checksum = $2
-            LIMIT 1
-            "#,
-            workspace_id,
-            checksum
+        self.fetch_pdf_row(
+            "WHERE d.workspace_id = $1 AND d.sha256_checksum = $2",
+            None,
+            Some(workspace_id),
+            Some(checksum),
         )
-        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Database(format!("Failed to find PDF by checksum: {}", e)))?;
-
-        Ok(row.map(|r| PdfDocument {
-            pdf_id: r.pdf_id,
-            workspace_id: r.workspace_id,
-            document_id: r.document_id,
-            filename: r.filename,
-            content_type: r.content_type,
-            file_size_bytes: r.file_size_bytes,
-            sha256_checksum: r.sha256_checksum,
-            page_count: r.page_count,
-            pdf_data: r.pdf_data,
-            processing_status: r.processing_status.parse().unwrap(),
-            extraction_method: r.extraction_method.as_ref().and_then(|m| m.parse().ok()),
-            vision_model: r.vision_model,
-            markdown_content: r.markdown_content,
-            extraction_errors: r.extraction_errors,
-            created_at: r.created_at,
-            processed_at: r.processed_at,
-            updated_at: r.updated_at,
-        }))
     }
 
     async fn update_pdf_status(&self, pdf_id: &Uuid, status: PdfProcessingStatus) -> Result<()> {

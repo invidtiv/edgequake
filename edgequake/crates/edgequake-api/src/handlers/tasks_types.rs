@@ -36,6 +36,12 @@ pub struct ListTasksQuery {
 
     /// Sort order (asc, desc).
     pub order: Option<String>,
+
+    /// SPEC-090 F-090-14: keyset cursor — ISO-8601 `created_at` after which to continue.
+    pub after_created_at: Option<String>,
+
+    /// SPEC-090 F-090-14: keyset cursor — `track_id` tie-break with `after_created_at`.
+    pub after_track_id: Option<String>,
 }
 
 // ============================================================================
@@ -219,7 +225,9 @@ mod tests {
             "page": 2,
             "page_size": 50,
             "sort": "created_at",
-            "order": "desc"
+            "order": "desc",
+            "after_created_at": "2026-07-26T00:00:00Z",
+            "after_track_id": "track-abc"
         }"#;
         let query: ListTasksQuery = serde_json::from_str(json).unwrap();
         assert_eq!(query.status, Some("pending".to_string()));
@@ -228,6 +236,11 @@ mod tests {
         assert_eq!(query.page_size, Some(50));
         assert_eq!(query.sort, Some("created_at".to_string()));
         assert_eq!(query.order, Some("desc".to_string()));
+        assert_eq!(
+            query.after_created_at.as_deref(),
+            Some("2026-07-26T00:00:00Z")
+        );
+        assert_eq!(query.after_track_id.as_deref(), Some("track-abc"));
     }
 
     #[test]

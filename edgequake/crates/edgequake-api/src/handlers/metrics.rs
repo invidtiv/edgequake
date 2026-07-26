@@ -20,11 +20,26 @@ pub use crate::handlers::metrics_types::PrometheusMetrics;
 /// Sample runtime gauges (DB pool) immediately before scrape.
 fn refresh_runtime_gauges(state: &AppState) {
     #[cfg(feature = "postgres")]
-    if let Some(ref pool) = state.pg_pool {
-        edgequake_observability::record_db_pool_stats(
-            pool.size(),
-            pool.num_idle().min(u32::MAX as usize) as u32,
-        );
+    {
+        if let Some(ref bundle) = state.pool_bundle {
+            for (role, pool) in [
+                ("query", &bundle.query),
+                ("ingest", &bundle.ingest),
+                ("queue", &bundle.queue),
+                ("admin", &bundle.admin),
+            ] {
+                edgequake_observability::record_db_pool_stats_for_role(
+                    role,
+                    pool.size(),
+                    pool.num_idle().min(u32::MAX as usize) as u32,
+                );
+            }
+        } else if let Some(ref pool) = state.pg_pool {
+            edgequake_observability::record_db_pool_stats(
+                pool.size(),
+                pool.num_idle().min(u32::MAX as usize) as u32,
+            );
+        }
     }
     #[cfg(not(feature = "postgres"))]
     let _ = state;

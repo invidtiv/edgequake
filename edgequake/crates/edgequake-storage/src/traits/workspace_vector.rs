@@ -61,14 +61,49 @@ impl WorkspaceVectorConfig {
         self
     }
 
-    /// Generate the table name for this workspace.
-    ///
-    /// Format: eq_{namespace}_ws_{workspace_id_short}_vectors
-    /// Example: eq_default_ws_4e32a055_vectors
-    pub fn table_name(&self) -> String {
-        let short_id = &self.workspace_id.to_string()[..8];
-        format!("eq_{}_ws_{}_vectors", self.namespace, short_id)
+    /// Full-entropy workspace slug for NEW tables (hyphens → underscores).
+    pub fn workspace_slug(&self) -> String {
+        workspace_slug_full(&self.workspace_id)
     }
+
+    /// Legacy 8-char prefix slug (pre SPEC-090 F-090-17).
+    pub fn legacy_workspace_slug(&self) -> String {
+        workspace_slug_legacy(&self.workspace_id)
+    }
+
+    /// PostgresConfig namespace for this workspace (full slug).
+    pub fn namespace_prefix(&self) -> String {
+        format!("{}_ws_{}", self.namespace, self.workspace_slug())
+    }
+
+    /// Legacy namespace prefix (8-char slug).
+    pub fn legacy_namespace_prefix(&self) -> String {
+        format!("{}_ws_{}", self.namespace, self.legacy_workspace_slug())
+    }
+
+    /// Generate the table name for this workspace (full slug).
+    pub fn table_name(&self) -> String {
+        format!("eq_{}_ws_{}_vectors", self.namespace, self.workspace_slug())
+    }
+
+    /// Legacy table name (8-char slug) for backward compatibility reads.
+    pub fn legacy_table_name(&self) -> String {
+        format!(
+            "eq_{}_ws_{}_vectors",
+            self.namespace,
+            self.legacy_workspace_slug()
+        )
+    }
+}
+
+/// Full-entropy workspace slug: UUID with hyphens replaced by underscores.
+pub fn workspace_slug_full(workspace_id: &Uuid) -> String {
+    workspace_id.to_string().replace('-', "_")
+}
+
+/// Legacy 8-char UUID prefix (pre F-090-17).
+pub fn workspace_slug_legacy(workspace_id: &Uuid) -> String {
+    workspace_id.to_string()[..8].to_string()
 }
 
 /// Registry for managing per-workspace vector storage instances.

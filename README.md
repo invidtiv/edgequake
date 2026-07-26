@@ -5,7 +5,7 @@
 > **High-Performance Graph-RAG Framework in Rust**  
 > Transform documents into intelligent knowledge graphs for superior retrieval and generation
 
-[![Version](https://img.shields.io/badge/version-0.21.3-blue.svg?style=flat)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.22.0-blue.svg?style=flat)](CHANGELOG.md)
 [![Rust](https://img.shields.io/badge/rust-1.95+-orange.svg?style=flat&logo=rust)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg?style=flat)](LICENSE)
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen.svg?style=flat)](https://github.com/raphaelmansuy/edgequake)
@@ -69,14 +69,18 @@ EDGEQUAKE_LLM_PROVIDER=ollama \
 curl -s http://localhost:8080/health | python3 -m json.tool
 ```
 
-> Pin a version: `EDGEQUAKE_VERSION=0.21.3 sh quickstart.sh`
+> Pin a version: `EDGEQUAKE_VERSION=0.22.0 sh quickstart.sh`
 
-### What's new in 0.21.3
+### What's new in 0.22.0
 
-- **Pool-safe `/health` at scale (#336 / SPEC-089)** — page-scoped list reconcile + Postgres `SET LOCAL statement_timeout` so abandoned queries cannot exhaust the connection pool.
-- **Sibling hardening** — discovery, task stats, graph UI SQL, workspace stats, and reprocess admit (single cascade) share the same LAW-H2 timeout pattern.
+- **SPEC-090 performance closeout** — role-split `PgPoolBundle` (query/ingest/queue/admin), optional `DATABASE_READ_URL` for the query pool, and `make spec090-perf-smoke` gates.
+- **`edgequake migrate`** — admin-pool migrate + reconcile with rich console output; serving boot is verify-only unless `EDGEQUAKE_ALLOW_BOOT_MIGRATE=1` (`make dev` / `backend-bg` set this by default).
+- **Schema cutovers** — M104 monthly `tasks` partitions; M105 PDF bytes SSOT in `pdf_document_blobs` (drops `pdf_documents.pdf_data`).
+- **ANN / embedding** — mutual-exclusive hot-workspace HNSW, index-shape manifest check, embedding identity columns on upsert.
 
-Also in **0.21.2**: dashboard stats N+1 (#334), shared guest identity (#335). **0.21.1**: SPEC-084 reliability (#331/#319/#317/#255/#318/#316). **0.21.0**: LightRAG query-API parity (074–085), D-30 `eq_rel_type`, SPEC-083 closure.
+**Upgrade:** run `edgequake migrate` (with `DATABASE_URL`) before starting a new binary when boot migrate is disabled.
+
+Also in **0.21.3**: pool-safe `/health` (#336 / SPEC-089). **0.21.2**: dashboard stats N+1 (#334), shared guest (#335). **0.21.1**: SPEC-084 reliability.
 ### Performance testing
 
 Publish Acc is **medical-mid n=200** (`make bench`) — not smoke n=40. Latest publish pack (`medical-mid-20260723T134124Z`): Acc EQ **0.770** vs LR **0.779** (Δ Acc 95% CI **[-0.045, +0.026]** — **statistical tie**; do **not** claim EQ beats LightRAG). Fair cold latency ratio **1.02×** (`C1COLD_v1`). Smoke peers remain CI/ablation references only.
@@ -292,10 +296,10 @@ docker compose -f docker-compose.prebuilt.yml up -d
 
 ```bash
 # Pin full stack to this release
-EDGEQUAKE_VERSION=0.21.3 docker compose -f docker-compose.quickstart.yml up -d
+EDGEQUAKE_VERSION=0.22.0 docker compose -f docker-compose.quickstart.yml up -d
 
 # Pin PostgreSQL major (optional; default tag follows EDGEQUAKE_VERSION → PG18)
-EDGEQUAKE_VERSION=0.21.3 EDGEQUAKE_POSTGRES_TAG=0.21.0-pg16 \
+EDGEQUAKE_VERSION=0.22.0 EDGEQUAKE_POSTGRES_TAG=0.21.0-pg16 \
   docker compose -f docker-compose.quickstart.yml up -d
 ```
 

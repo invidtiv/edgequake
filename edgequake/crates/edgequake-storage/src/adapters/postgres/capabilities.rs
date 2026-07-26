@@ -18,7 +18,7 @@ pub const SUPPORTED_VECTOR_METRIC: &str = "cosine";
 /// Opclass suffix used for full `vector` columns (cosine only).
 pub const VECTOR_COSINE_OPCLASS: &str = "vector_cosine_ops";
 
-/// Vector column storage mode (`EDGEQUAKE_VECTOR_STORAGE`, default `full`).
+/// Vector column storage mode (`EDGEQUAKE_VECTOR_STORAGE`, default `halfvec`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VectorStorageMode {
     Full,
@@ -82,7 +82,7 @@ impl AnnIndexPolicy {
 impl VectorStorageMode {
     pub fn from_env() -> Self {
         match std::env::var("EDGEQUAKE_VECTOR_STORAGE")
-            .unwrap_or_else(|_| "full".into())
+            .unwrap_or_else(|_| "halfvec".into())
             .to_ascii_lowercase()
             .as_str()
         {
@@ -135,16 +135,27 @@ impl DocumentIdGenerator {
     }
 }
 
-/// Compare dotted semver-like extension versions (e.g. `0.8.3`, `1.7.0`).
-pub fn extension_version_at_least(version: &str, minimum: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
-            .collect()
+/// Parse dotted semver-like extension version into numeric parts + pre-release flag.
+fn parse_extension_version(v: &str) -> (Vec<u32>, bool) {
+    let v = v.trim();
+    let (main, has_prerelease) = match v.find('-') {
+        Some(i) => (&v[..i], true),
+        None => (v, false),
     };
-    let va = parse(version);
-    let vb = parse(minimum);
+    let parts: Vec<u32> = main
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    (parts, has_prerelease)
+}
+
+/// Compare dotted semver-like extension versions (e.g. `0.8.3`, `1.7.0`).
+///
+/// Pre-releases sort below release: `0.8.0-rc1` < `0.8.0` (SPEC-090 F-090-22).
+pub fn extension_version_at_least(version: &str, minimum: &str) -> bool {
+    let (va, va_pre) = parse_extension_version(version);
+    let (vb, vb_pre) = parse_extension_version(minimum);
     if va.is_empty() {
         return false;
     }
@@ -157,6 +168,10 @@ pub fn extension_version_at_least(version: &str, minimum: &str) -> bool {
         if a < b {
             return false;
         }
+    }
+    // Same numeric tuple: a pre-release is strictly less than a release.
+    if va_pre && !vb_pre {
+        return false;
     }
     true
 }
@@ -297,5 +312,22 @@ mod ann_index_policy_tests {
     fn resolve_5000_skips_hnsw() {
         let p = AnnIndexPolicy::resolve(5000, VectorStorageMode::Full);
         assert!(!p.hnsw_viable);
+    }
+
+    #[test]
+    fn extension_version_prerelease_below_release() {
+        assert!(!extension_version_at_least("0.8.0-rc1", "0.8.0"));
+        assert!(extension_version_at_least("0.8.0", "0.8.0-rc1"));
+        assert!(extension_version_at_least("0.8.1-rc1", "0.8.0"));
+    }
+
+    #[test]
+    fn vector_storage_mode_defaults_to_halfvec() {
+        let prev = std::env::var("EDGEQUAKE_VECTOR_STORAGE").ok();
+        std::env::remove_var("EDGEQUAKE_VECTOR_STORAGE");
+        assert_eq!(VectorStorageMode::from_env(), VectorStorageMode::Half);
+        if let Some(v) = prev {
+            std::env::set_var("EDGEQUAKE_VECTOR_STORAGE", v);
+        }
     }
 }

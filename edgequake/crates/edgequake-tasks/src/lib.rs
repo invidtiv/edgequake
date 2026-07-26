@@ -73,6 +73,7 @@
 
 pub mod admission;
 pub mod cancellation;
+pub mod config;
 pub mod delivery;
 pub mod error;
 pub mod ingestion_reliability;
@@ -95,6 +96,11 @@ pub use admission::{
     ADMISSION_MAX_BYTES_ENV, DEFAULT_MAX_IN_FLIGHT_BYTES, DEFAULT_TASK_BYTE_COST,
 };
 pub use cancellation::CancellationRegistry;
+pub use config::{
+    task_max_workers_from_env, task_retention_days_from_env, CLAIM_SAMPLE_LIMIT,
+    DEFAULT_TASK_MAX_WORKERS, DEFAULT_TASK_RETENTION_DAYS, TASK_MAX_WORKERS_ENV,
+    TASK_RETENTION_DAYS_ENV,
+};
 pub use delivery::{
     delivery_mode_from_env, enqueue_with_delivery, is_multi_replica_deployment,
     parse_delivery_mode, replicas_from_env, validate_delivery_for_replicas, BridgedTaskQueue,

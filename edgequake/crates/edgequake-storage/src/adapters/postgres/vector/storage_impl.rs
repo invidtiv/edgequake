@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use sqlx::Row;
 
 use super::super::ann_exact_reorder_policy::{build_ann_select_sql, AnnExactReorderPolicy};
+use super::super::statement_timeout::{vector_query_statement_timeout_ms, LocalTimeoutTx};
 use super::PgVectorStorage;
 use crate::error::{Result, StorageError};
 use crate::traits::{MetadataFilter, VectorSearchResult, VectorStorage};
@@ -52,7 +53,11 @@ impl VectorStorage for PgVectorStorage {
         let pool = self.pool.get().await?;
         let embedding_str = Self::format_embedding(query_embedding);
         let emb_type = self.embedding_pg_type();
-        let reorder = AnnExactReorderPolicy::from_env();
+        // SPEC-090 F-090-06: couple exact reorder when iterative_scan is relaxed_order.
+        let reorder = AnnExactReorderPolicy::for_search(
+            super::super::HnswRuntimePolicy::from_env().iterative_scan_mode,
+            top_k,
+        );
         // When reorder is on, tune ef_search against the wider candidate pool.
         let tune_k = reorder.effective_candidate_k(top_k);
 
@@ -80,18 +85,19 @@ impl VectorStorage for PgVectorStorage {
 
         // QW3: run inside a short transaction so we can raise recall via
         // `SET LOCAL` GUCs scoped to just this search (never leaking onto the
-        // shared pooled connection). The plain `query()` path applies no
-        // metadata post-filter, so iterative_scan is not requested here.
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| StorageError::Database(format!("Failed to begin query tx: {}", e)))?;
+        // shared pooled connection). SPEC-090 F-090-27: also SET LOCAL
+        // statement_timeout so Postgres cancels before the app abandons the future.
+        let mut conn = pool.acquire().await.map_err(|e| {
+            StorageError::Connection(format!("Failed to acquire connection for query: {e}"))
+        })?;
+        let timeout_ms = vector_query_statement_timeout_ms();
+        let mut timed = LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
 
         for stmt in
             Self::search_tuning_statements(self.effective_index_type(), tune_k, false, false)
         {
             sqlx::query(&stmt)
-                .execute(&mut *tx)
+                .execute(&mut **timed.as_mut())
                 .await
                 .map_err(|e| StorageError::Database(format!("Failed to set search GUC: {}", e)))?;
         }
@@ -101,20 +107,21 @@ impl VectorStorage for PgVectorStorage {
                 .bind(&embedding_str)
                 .bind(ids)
                 .bind(top_k as i32)
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut **timed.as_mut())
                 .await
         } else {
             sqlx::query(&sql)
                 .bind(&embedding_str)
                 .bind(top_k as i32)
-                .fetch_all(&mut *tx)
+                .fetch_all(&mut **timed.as_mut())
                 .await
         };
 
         let rows =
             rows.map_err(|e| StorageError::Database(format!("Vector query failed: {}", e)))?;
 
-        tx.commit()
+        timed
+            .commit()
             .await
             .map_err(|e| StorageError::Database(format!("Failed to commit query tx: {}", e)))?;
 
@@ -198,88 +205,131 @@ impl VectorStorage for PgVectorStorage {
 
         // QW2: single round trip per chunk via UNNEST instead of one INSERT per
         // row. WHY chunk: bounds per-statement memory/transaction size for very
-        // large ingests; UNNEST keeps the bind-parameter count constant (3)
+        // large ingests; UNNEST keeps the bind-parameter count constant (4)
         // regardless of row count, so we are not limited by Postgres' 65535
-        // parameter cap. All chunks run in ONE transaction for atomicity.
+        // parameter cap.
+        // SPEC-090 F-090-02 / LAW-P3: commit **per chunk** (idempotent ON CONFLICT);
+        // document-scoped TX pinned xmin and blocked vacuum for the whole ingest.
         // SPEC-047 P3: tunable via EDGEQUAKE_VECTOR_UPSERT_CHUNK (default 1000).
         let chunk_size = crate::vector_upsert_chunk_size();
 
         let emb_type = self.embedding_pg_type();
-        // SPEC-058: populate writable content_tsv from metadata content or KV
-        // (content_ref SSOT). Entity/rel rows get empty tsvector (fine — FTS
-        // filters by vector_type=chunk).
+        // SPEC-090 F-090-03: resolve content in-app (4th UNNEST) — no correlated KV subquery.
         let join_kv = self.chunk_kv_table_exists_cached().await.unwrap_or(false);
-        let content_tsv_expr = if join_kv {
-            format!(
-                r#"to_tsvector(
-                    'english',
-                    coalesce(
-                        t.metadata->>'content',
-                        (
-                            SELECT k.value->>'content'
-                            FROM {kv} k
-                            WHERE k.key = coalesce(t.metadata->>'content_ref', t.id)
-                            LIMIT 1
-                        ),
-                        ''
-                    )
-                )"#,
-                kv = self.chunk_kv_table_name
-            )
-        } else {
-            "to_tsvector('english', coalesce(t.metadata->>'content', ''))".to_string()
-        };
+        let emb_model = std::env::var("EDGEQUAKE_EMBEDDING_MODEL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "unknown".to_string());
         // SPEC-059: xmax=0 means freshly inserted; non-zero means ON CONFLICT update.
+        // SPEC-090 F-090-23: stamp embedding identity columns + metadata keys.
         let sql = format!(
             r#"
-            INSERT INTO {table} (id, embedding, metadata, document_id, tenant_id, workspace_id, content_tsv)
+            INSERT INTO {table} (
+                id, embedding, metadata, document_id, tenant_id, workspace_id,
+                content_tsv, embedding_model, embedding_dim, embedding_norm
+            )
             SELECT
                 t.id,
                 t.embedding::{emb_type},
-                t.metadata,
+                t.metadata
+                  || jsonb_build_object(
+                       'embedding_model', COALESCE(t.metadata->>'embedding_model', $5::text),
+                       'embedding_dim', {dim},
+                       'embedding_norm', 'cosine'
+                     ),
                 COALESCE(t.metadata->>'document_id', t.metadata->>'source_document_id'),
                 t.metadata->>'tenant_id',
                 t.metadata->>'workspace_id',
-                {content_tsv_expr}
-            FROM UNNEST($1::text[], $2::text[], $3::jsonb[]) AS t(id, embedding, metadata)
+                to_tsvector('english', coalesce(t.content, '')),
+                COALESCE(t.metadata->>'embedding_model', $5::text),
+                {dim},
+                'cosine'
+            FROM UNNEST($1::text[], $2::text[], $3::jsonb[], $4::text[]) AS t(id, embedding, metadata, content)
             ON CONFLICT (id) DO UPDATE SET
                 embedding = EXCLUDED.embedding,
                 metadata = EXCLUDED.metadata,
                 document_id = EXCLUDED.document_id,
                 tenant_id = EXCLUDED.tenant_id,
                 workspace_id = EXCLUDED.workspace_id,
-                content_tsv = EXCLUDED.content_tsv
+                content_tsv = EXCLUDED.content_tsv,
+                embedding_model = EXCLUDED.embedding_model,
+                embedding_dim = EXCLUDED.embedding_dim,
+                embedding_norm = EXCLUDED.embedding_norm
             RETURNING id, (xmax = 0) AS inserted
             "#,
             table = self.table_name,
             emb_type = emb_type,
-            content_tsv_expr = content_tsv_expr
+            dim = self.dimension
         );
-
-        let mut tx = pool
-            .begin()
-            .await
-            .map_err(|e| StorageError::Database(format!("Failed to begin upsert tx: {}", e)))?;
 
         let mut created: Vec<String> = Vec::new();
         for chunk in kept.chunks(chunk_size) {
             let mut ids: Vec<String> = Vec::with_capacity(chunk.len());
             let mut embeddings: Vec<String> = Vec::with_capacity(chunk.len());
             let mut metadatas: Vec<serde_json::Value> = Vec::with_capacity(chunk.len());
+            let mut contents: Vec<String> = Vec::with_capacity(chunk.len());
+            let mut missing_keys: Vec<String> = Vec::new();
+            let mut missing_idx: Vec<usize> = Vec::new();
             for &i in chunk {
                 let (id, embedding, metadata) = &data[i];
                 ids.push(id.clone());
                 embeddings.push(Self::format_embedding(embedding));
                 metadatas.push(metadata.clone());
+                if let Some(c) = metadata.get("content").and_then(|v| v.as_str()) {
+                    contents.push(c.to_string());
+                } else {
+                    let ref_key = metadata
+                        .get("content_ref")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(id.as_str())
+                        .to_string();
+                    missing_keys.push(ref_key);
+                    missing_idx.push(contents.len());
+                    contents.push(String::new());
+                }
+            }
+            if join_kv && !missing_keys.is_empty() {
+                let kv_sql = format!(
+                    "SELECT key, value->>'content' AS content FROM {} WHERE key = ANY($1)",
+                    self.chunk_kv_table_name
+                );
+                let rows = sqlx::query(&kv_sql)
+                    .bind(&missing_keys)
+                    .fetch_all(&pool)
+                    .await
+                    .map_err(|e| {
+                        StorageError::Database(format!("KV content resolve failed: {e}"))
+                    })?;
+                let mut map = std::collections::HashMap::new();
+                for row in rows {
+                    let k: String = row.get("key");
+                    let c: Option<String> = row.get("content");
+                    if let Some(c) = c {
+                        map.insert(k, c);
+                    }
+                }
+                for (pos, key) in missing_keys.iter().enumerate() {
+                    if let Some(c) = map.get(key) {
+                        contents[missing_idx[pos]] = c.clone();
+                    }
+                }
             }
 
+            let mut tx = pool.begin().await.map_err(|e| {
+                StorageError::Database(format!("Failed to begin upsert chunk tx: {}", e))
+            })?;
             let rows = sqlx::query(&sql)
                 .bind(&ids)
                 .bind(&embeddings)
                 .bind(&metadatas)
+                .bind(&contents)
+                .bind(&emb_model)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| StorageError::Database(format!("Batch upsert failed: {}", e)))?;
+            tx.commit().await.map_err(|e| {
+                StorageError::Database(format!("Failed to commit upsert chunk tx: {}", e))
+            })?;
             for row in rows {
                 let id: String = row.get("id");
                 let inserted: bool = row.get("inserted");
@@ -288,10 +338,6 @@ impl VectorStorage for PgVectorStorage {
                 }
             }
         }
-
-        tx.commit()
-            .await
-            .map_err(|e| StorageError::Database(format!("Failed to commit upsert tx: {}", e)))?;
 
         Ok(created)
     }
@@ -353,14 +399,17 @@ impl VectorStorage for PgVectorStorage {
 
     async fn delete_entity_relations(&self, entity_name: &str) -> Result<()> {
         let pool = self.pool.get().await?;
-
+        // SPEC-090 F-090-09b: UNION ctid arms — avoid non-sargable OR across JSONB keys.
         let sql = format!(
             r#"
-            DELETE FROM {} 
-            WHERE metadata->>'source' = $1 
-               OR metadata->>'target' = $1
+            DELETE FROM {table}
+            WHERE ctid IN (
+                SELECT ctid FROM {table} WHERE metadata->>'source' = $1
+                UNION
+                SELECT ctid FROM {table} WHERE metadata->>'target' = $1
+            )
             "#,
-            self.table_name
+            table = self.table_name
         );
 
         sqlx::query(&sql)
@@ -497,26 +546,28 @@ impl VectorStorage for PgVectorStorage {
 
     /// Clear vectors for a specific workspace.
     ///
-    /// QW6: match the materialized `workspace_id` column FIRST, then fall back
-    /// to the JSONB key.
-    ///
-    /// # WHY both predicates
-    /// Rows written after the SPEC-007 Tier-3 dual-write carry a populated
-    /// `workspace_id` column, while rows written before the backfill (or by
-    /// older code paths) only carry `metadata->>'workspace_id'`. Matching on
-    /// the column alone would silently leave legacy rows behind on delete;
-    /// matching on JSONB alone forfeits the column index. The `OR` keeps the
-    /// delete correct during and after the migration window.
+    /// QW6 / SPEC-090 F-090-09: sargable delete arms — indexed `workspace_id`
+    /// column first, then JSONB-only legacy rows via UNION ctid (no bare OR).
     async fn clear_workspace(&self, workspace_id: &uuid::Uuid) -> Result<usize> {
         let pool = self.pool.get().await?;
+        let ws = workspace_id.to_string();
 
         let sql = format!(
-            "DELETE FROM {} WHERE workspace_id = $1 OR metadata->>'workspace_id' = $1",
-            self.table_name
+            r#"
+            DELETE FROM {table}
+            WHERE ctid IN (
+                SELECT ctid FROM {table} WHERE workspace_id = $1
+                UNION
+                SELECT ctid FROM {table}
+                WHERE metadata->>'workspace_id' = $1
+                  AND workspace_id IS DISTINCT FROM $1
+            )
+            "#,
+            table = self.table_name
         );
 
         let result = sqlx::query(&sql)
-            .bind(workspace_id.to_string())
+            .bind(&ws)
             .execute(&pool)
             .await
             .map_err(|e| StorageError::Database(format!("Clear workspace failed: {}", e)))?;
@@ -526,8 +577,7 @@ impl VectorStorage for PgVectorStorage {
 
     /// SPEC-047 P1a: wipe all vectors for a document on force_reindex / re-ingest.
     ///
-    /// WHY both column and JSONB: dual-write era rows may only have one side set.
-    /// WHY id prefix: legacy chunk rows keyed `{doc}-chunk-N` without metadata.
+    /// SPEC-090 F-090-09: four sargable delete arms via UNION ctid (no bare OR).
     async fn delete_by_document(&self, document_id: &str) -> Result<usize> {
         if document_id.is_empty() {
             return Ok(0);
@@ -536,13 +586,27 @@ impl VectorStorage for PgVectorStorage {
         let chunk_prefix = format!("{document_id}-chunk-%");
         let sql = format!(
             r#"
-            DELETE FROM {}
-            WHERE document_id = $1
-               OR metadata->>'document_id' = $1
-               OR metadata->>'source_document_id' = $1
-               OR id LIKE $2
+            DELETE FROM {table}
+            WHERE ctid IN (
+                SELECT ctid FROM {table} WHERE document_id = $1
+                UNION
+                SELECT ctid FROM {table}
+                WHERE metadata->>'document_id' = $1
+                  AND document_id IS DISTINCT FROM $1
+                UNION
+                SELECT ctid FROM {table}
+                WHERE metadata->>'source_document_id' = $1
+                  AND document_id IS DISTINCT FROM $1
+                  AND COALESCE(metadata->>'document_id', '') IS DISTINCT FROM $1
+                UNION
+                SELECT ctid FROM {table}
+                WHERE id LIKE $2
+                  AND document_id IS DISTINCT FROM $1
+                  AND COALESCE(metadata->>'document_id', '') IS DISTINCT FROM $1
+                  AND COALESCE(metadata->>'source_document_id', '') IS DISTINCT FROM $1
+            )
             "#,
-            self.table_name
+            table = self.table_name
         );
         let result = sqlx::query(&sql)
             .bind(document_id)
@@ -596,16 +660,29 @@ impl VectorStorage for PgVectorStorage {
             _ => return self.query(query_embedding, top_k, filter_ids).await,
         };
 
-        // SPEC-065: productize Wave-2 — create hot-workspace partial HNSW when opt-in.
-        // Fail-closed: DDL errors propagate (no silent seq-scan).
+        // SPEC-090 F-090-05 / LAW-P1: never CREATE INDEX on the query path.
+        // Probes are TTL-cached; ANN DDL is warmup / ingest only.
         let mut wave2_partial_ready = false;
-        // SPEC-080: count before begin() — avoids second pool acquire while holding a tx.
         let mut workspace_row_count: Option<u64> = None;
         if let Some(ws) = mf.workspace_id.as_deref() {
-            workspace_row_count = Some(self.count_workspace_rows(ws).await?);
-            if crate::hnsw_partial_by_workspace_enabled() {
-                let _created = self.ensure_hot_workspace_ann(ws).await?;
-                wave2_partial_ready = self.partial_ann_index_exists(ws).await?;
+            if let Some(cached) = super::super::workspace_probe_cache::get(&self.table_name, ws) {
+                workspace_row_count = Some(cached.row_count);
+                wave2_partial_ready = cached.partial_ann_ready;
+            } else {
+                let row_count = self.count_workspace_rows(ws).await?;
+                let partial_ready = if crate::hnsw_partial_by_workspace_enabled() {
+                    self.partial_ann_index_exists(ws).await?
+                } else {
+                    false
+                };
+                super::super::workspace_probe_cache::put(
+                    &self.table_name,
+                    ws,
+                    row_count,
+                    partial_ready,
+                );
+                workspace_row_count = Some(row_count);
+                wave2_partial_ready = partial_ready;
             }
         }
 
@@ -621,8 +698,11 @@ impl VectorStorage for PgVectorStorage {
             format!("WHERE {}", filter_sql.conditions.join(" AND "))
         };
 
-        // SPEC-076 A3: opt-in ANN → exact reorder (default OFF).
-        let reorder = AnnExactReorderPolicy::from_env();
+        // SPEC-090 F-090-06: couple exact reorder when iterative_scan is relaxed_order.
+        let reorder = AnnExactReorderPolicy::for_search(
+            super::super::HnswRuntimePolicy::from_env().iterative_scan_mode,
+            top_k,
+        );
         let tune_k = reorder.effective_candidate_k(top_k);
         let sql = crate::dataop::sql_comment(
             crate::dataop::DATA_PGVEC_VECTORS_ANN_QUERY_FILTERED_002,
@@ -695,9 +775,14 @@ impl VectorStorage for PgVectorStorage {
 
         // QW3: metadata pre-filter present -> raise recall AND enable iterative
         // scan (scoped to this transaction) so the post-filter LIMIT is met.
-        let mut tx = pool.begin().await.map_err(|e| {
-            StorageError::Database(format!("Failed to begin filtered query tx: {}", e))
+        // SPEC-090 F-090-27: SET LOCAL statement_timeout (LAW-H2).
+        let mut conn = pool.acquire().await.map_err(|e| {
+            StorageError::Connection(format!(
+                "Failed to acquire connection for filtered query: {e}"
+            ))
         })?;
+        let timeout_ms = vector_query_statement_timeout_ms();
+        let mut timed = LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
 
         for stmt in Self::search_tuning_statements(
             self.effective_index_type(),
@@ -706,7 +791,7 @@ impl VectorStorage for PgVectorStorage {
             iterative_scan,
         ) {
             sqlx::query(&stmt)
-                .execute(&mut *tx)
+                .execute(&mut **timed.as_mut())
                 .await
                 .map_err(|e| StorageError::Database(format!("Failed to set search GUC: {}", e)))?;
         }
@@ -720,17 +805,20 @@ impl VectorStorage for PgVectorStorage {
             mf,
             workspace_row_count,
         ) {
-            sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
-                StorageError::Database(format!("Failed to set Wave-2 planner bias: {e}"))
-            })?;
+            sqlx::query(&stmt)
+                .execute(&mut **timed.as_mut())
+                .await
+                .map_err(|e| {
+                    StorageError::Database(format!("Failed to set Wave-2 planner bias: {e}"))
+                })?;
         }
 
         let rows = sqlx::query_with(&sql, args)
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **timed.as_mut())
             .await
             .map_err(|e| StorageError::Database(format!("Filtered vector query failed: {}", e)))?;
 
-        tx.commit().await.map_err(|e| {
+        timed.commit().await.map_err(|e| {
             StorageError::Database(format!("Failed to commit filtered query tx: {}", e))
         })?;
 

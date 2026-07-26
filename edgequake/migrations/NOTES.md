@@ -58,8 +58,8 @@ NNN_descriptive_name.sql
   descriptive_name: snake_case, describes what changed
 ```
 
-Current max: `098_batch_deletion_task_type_and_claim_index.sql`  
-Next available: `099_*`
+Current max: `105_pdf_blob_cutover.sql`  
+Next available: `106_*`
 
 ### Every-boot reconcile SSOT (not checksum-locked)
 

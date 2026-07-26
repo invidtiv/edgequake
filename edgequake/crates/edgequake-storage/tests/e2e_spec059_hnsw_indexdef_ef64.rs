@@ -1,4 +1,4 @@
-//! SPEC-059 Wave 5 — new HNSW indexes use ef_construction=64 (or env).
+//! SPEC-059 Wave 5 — new HNSW indexes use ef_construction=128 (or env).
 
 #![cfg(feature = "postgres")]
 
@@ -18,8 +18,8 @@ async fn e2e_spec059_new_hnsw_indexdef_ef_construction_64() {
 
     let expected = hnsw_ef_construction_from_env();
     assert!(
-        expected >= 64 || std::env::var("EDGEQUAKE_HNSW_EF_CONSTRUCTION").is_ok(),
-        "default ef_construction must be 64 when unset (got {expected})"
+        expected >= 128 || std::env::var("EDGEQUAKE_HNSW_EF_CONSTRUCTION").is_ok(),
+        "default ef_construction must be 128 when unset (got {expected})"
     );
 
     let storage = PgVectorStorage::with_dimension(config.clone(), DIM);

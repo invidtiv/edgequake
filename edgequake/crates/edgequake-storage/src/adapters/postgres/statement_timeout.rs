@@ -10,7 +10,7 @@ use sqlx::{Acquire, PgConnection, Postgres, Transaction};
 use crate::error::{Result, StorageError};
 
 /// Open transaction with `SET LOCAL statement_timeout` already applied.
-pub(in crate::adapters::postgres::graph) struct LocalTimeoutTx<'c> {
+pub(in crate::adapters::postgres) struct LocalTimeoutTx<'c> {
     inner: Transaction<'c, Postgres>,
 }
 
@@ -56,7 +56,7 @@ const GRAPH_QUERY_PG_HEADROOM_MS: u32 = 250;
 ///
 /// Mirrors app budget (`EDGEQUAKE_GRAPH_QUERY_TIMEOUT_SECS`, 15s) minus
 /// [`GRAPH_QUERY_PG_HEADROOM_MS`] so the server wins the cancel race.
-pub(in crate::adapters::postgres::graph) fn graph_query_statement_timeout_ms() -> u32 {
+pub(in crate::adapters::postgres) fn graph_query_statement_timeout_ms() -> u32 {
     let secs = std::env::var("EDGEQUAKE_GRAPH_QUERY_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
@@ -77,6 +77,19 @@ pub fn interactive_statement_timeout_ms() -> u32 {
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(2_500)
+        .clamp(500, 30_000);
+    ms.saturating_sub(GRAPH_QUERY_PG_HEADROOM_MS).max(1)
+}
+
+/// Vector ANN search PG kill (SPEC-090 F-090-27).
+///
+/// Default 2000ms minus headroom so Postgres cancels before the app abandons
+/// the future (LAW-H2). Override with `EDGEQUAKE_VECTOR_QUERY_TIMEOUT_MS`.
+pub(in crate::adapters::postgres) fn vector_query_statement_timeout_ms() -> u32 {
+    let ms = std::env::var("EDGEQUAKE_VECTOR_QUERY_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2_000)
         .clamp(500, 30_000);
     ms.saturating_sub(GRAPH_QUERY_PG_HEADROOM_MS).max(1)
 }
@@ -104,6 +117,17 @@ mod tests {
         assert!(interactive_statement_timeout_ms() < 2_500);
         if let Some(v) = prev {
             std::env::set_var("EDGEQUAKE_DOCUMENTS_READ_TIMEOUT_MS", v);
+        }
+    }
+
+    #[test]
+    fn vector_query_timeout_ms_default_is_under_budget() {
+        let prev = std::env::var("EDGEQUAKE_VECTOR_QUERY_TIMEOUT_MS").ok();
+        std::env::remove_var("EDGEQUAKE_VECTOR_QUERY_TIMEOUT_MS");
+        assert_eq!(vector_query_statement_timeout_ms(), 1_750);
+        assert!(vector_query_statement_timeout_ms() < 2_000);
+        if let Some(v) = prev {
+            std::env::set_var("EDGEQUAKE_VECTOR_QUERY_TIMEOUT_MS", v);
         }
     }
 }

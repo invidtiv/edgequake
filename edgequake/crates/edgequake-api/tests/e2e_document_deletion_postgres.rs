@@ -210,6 +210,7 @@ async fn create_postgres_test_state(pool: &PgPool) -> AppState {
         cache_manager: CacheManager::with_defaults(),
         rate_limiter: RateLimiter::new(TokenBucketConfig::strict(100, 60)),
         pg_pool: Some(pool.clone()),
+        pool_bundle: None,
         start_time: std::time::Instant::now(),
         path_validation_config: edgequake_api::path_validation::PathValidationConfig {
             allow_any_path: true,

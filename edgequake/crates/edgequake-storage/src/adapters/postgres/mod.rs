@@ -40,6 +40,7 @@ mod conversation;
 mod diskann_runtime_policy;
 mod filtered_diskann_label_policy;
 mod graph;
+mod hnsw_manifest;
 mod hnsw_runtime_policy;
 mod id_allocation;
 mod kv;
@@ -47,10 +48,14 @@ mod mm_asset_storage_impl;
 mod original_storage_impl;
 mod pdf_list_query;
 mod pdf_storage_impl;
+mod pool_bundle;
 pub mod rls;
 mod row_count_stats;
 mod schema;
+mod statement_timeout;
 mod vector;
+mod workspace_probe_cache;
+mod workspace_table;
 mod workspace_vector;
 
 pub use age_csv_loader::{load_vertices_from_csv, should_use_copy_loader};
@@ -68,8 +73,10 @@ pub use capabilities::{
     PGVECTOR_MIN_CVE_SAFE, PGVECTOR_MIN_ITERATIVE_SCAN, SUPPORTED_VECTOR_METRIC,
     VECTOR_COSINE_OPCLASS,
 };
-pub use config::{hnsw_ef_construction_from_env, PostgresConfig, VectorIndexType};
-pub use connection::PostgresPool;
+pub use config::{
+    hnsw_ef_construction_from_env, resolve_pool_max_connections, PostgresConfig, VectorIndexType,
+};
+pub use connection::{with_session_hygiene, PostgresPool};
 pub use conversation::PostgresConversationStorage;
 pub use diskann_runtime_policy::{
     diskann_optin_recipe_statements, diskann_query_tuning_statements, diskann_rescore_for_list,
@@ -84,6 +91,7 @@ pub use graph::{
     interactive_statement_timeout_ms, PostgresAGEGraphStorage, LAST_SOURCE_PREFIX_COUNT_LEN,
     SOURCE_PREFIX_DISCOVERY_CALLS,
 };
+pub use hnsw_manifest::{check_hnsw_index_manifest, HnswIndexManifest, HnswManifestDrift};
 pub use hnsw_runtime_policy::{
     filtered_ann_gucs_satisfy_contract, hnsw_partial_by_workspace_enabled,
     parse_hnsw_iterative_scan_mode, parse_partial_by_workspace_env, HnswRuntimePolicy,
@@ -93,6 +101,7 @@ pub use kv::PostgresKVStorage;
 pub use mm_asset_storage_impl::PostgresMmAssetStorage;
 pub use original_storage_impl::PostgresOriginalStorage;
 pub use pdf_storage_impl::PostgresPdfStorage;
+pub use pool_bundle::{pool_role_max_connections, PgPoolBundle, PoolRole};
 #[allow(deprecated)]
 pub use rls::{
     acquire_rls_connection, clear_tenant_context, clear_tenant_context_on_conn,

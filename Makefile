@@ -372,6 +372,7 @@ printf '%s\n' "export EDGEQUAKE_ADAPTIVE_CHUNKING=\"$${EDGEQUAKE_ADAPTIVE_CHUNKI
 printf '%s\n' "export EDGEQUAKE_CHUNK_SIZE=\"$${EDGEQUAKE_CHUNK_SIZE:-1200}\"" >> /tmp/edgequake-start.sh; \
 printf '%s\n' "export EDGEQUAKE_CHUNK_OVERLAP=\"$${EDGEQUAKE_CHUNK_OVERLAP:-100}\"" >> /tmp/edgequake-start.sh; \
 printf '%s\n' "export DATABASE_POOL_SIZE=\"$(DATABASE_POOL_SIZE)\"" >> /tmp/edgequake-start.sh; \
+printf '%s\n' "export EDGEQUAKE_ALLOW_BOOT_MIGRATE=\"$${EDGEQUAKE_ALLOW_BOOT_MIGRATE:-1}\"" >> /tmp/edgequake-start.sh; \
 printf '%s\n' "export VLM_PROCESS_ENABLE=\"$(VLM_PROCESS_ENABLE)\"" >> /tmp/edgequake-start.sh; \
 printf '%s\n' "export EDGEQUAKE_CHART_MODALITY_FILTER=\"true\"" >> /tmp/edgequake-start.sh; \
 printf '%s\n' "export EDGEQUAKE_MM_ANALYSIS_CACHE=\"true\"" >> /tmp/edgequake-start.sh; \
@@ -2560,6 +2561,11 @@ spec020-qc-proof-auth: ## SPEC-020 auth-enabled login proof (DEV_AUTH_ENABLED=tr
 release-gates: ## Pre-release gate: fmt, workspace clippy, SPEC-006/018, WebUI, version parity
 	@chmod +x scripts/release_gates.sh
 	@./scripts/release_gates.sh
+
+.PHONY: spec090-perf-smoke
+spec090-perf-smoke: ## SPEC-090 falsifiable scaling smoke (needs DATABASE_URL)
+	@chmod +x scripts/perf/spec090_scaling_smoke.sh
+	@./scripts/perf/spec090_scaling_smoke.sh
 
 observability-proof: ## Run SPEC-018 observability proof suite (Rust + WebUI)
 	@./specs/018-observability/e2e/run_observability_proof.sh

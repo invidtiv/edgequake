@@ -16,6 +16,8 @@ pub async fn list_pdfs_dynamic(
     let mut query_parts = Vec::new();
     let mut param_idx = 1;
 
+    // SPEC-090 F-090-16 / LAW-P7: list projection is metadata-only.
+    // `pdf_data` and `markdown_content` are fetched on the by-id path only.
     let base_query = r#"
         SELECT
             pdf_id,
@@ -26,11 +28,9 @@ pub async fn list_pdfs_dynamic(
             file_size_bytes,
             sha256_checksum,
             page_count,
-            pdf_data,
             processing_status,
             extraction_method,
             vision_model,
-            markdown_content,
             extraction_errors,
             created_at,
             processed_at,
@@ -86,7 +86,7 @@ pub async fn list_pdfs_dynamic(
                 file_size_bytes: r.try_get("file_size_bytes")?,
                 sha256_checksum: r.try_get("sha256_checksum")?,
                 page_count: r.try_get("page_count")?,
-                pdf_data: r.try_get("pdf_data")?,
+                pdf_data: Vec::new(),
                 processing_status: {
                     let status_str: String = r.try_get("processing_status")?;
                     status_str.parse().unwrap()
@@ -96,7 +96,7 @@ pub async fn list_pdfs_dynamic(
                     method_opt.and_then(|m| m.parse().ok())
                 },
                 vision_model: r.try_get("vision_model")?,
-                markdown_content: r.try_get("markdown_content")?,
+                markdown_content: None,
                 extraction_errors: r.try_get("extraction_errors")?,
                 created_at: r.try_get("created_at")?,
                 processed_at: r.try_get("processed_at")?,

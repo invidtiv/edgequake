@@ -423,8 +423,7 @@ impl TaskStorage for MemoryTaskStorage {
             0.0
         };
 
-        // Worker utilization (assuming 4 max workers)
-        let max_workers = 4u32;
+        let max_workers = crate::config::task_max_workers_from_env();
         let active_workers = processing_count.min(max_workers as u64) as u32;
         let worker_utilization = ((active_workers as f64 / max_workers as f64) * 100.0) as u8;
 
@@ -441,6 +440,24 @@ impl TaskStorage for MemoryTaskStorage {
             rate_limited: false, // TODO: Track rate limiting separately
             timestamp: now,
         })
+    }
+
+    async fn prune_terminal_tasks(&self, older_than_days: u32) -> TaskResult<u64> {
+        let cutoff = Utc::now() - chrono::Duration::days(i64::from(older_than_days.max(1)));
+        let mut tasks = self.tasks.write().unwrap();
+        let before = tasks.len();
+        tasks.retain(|_, task| {
+            if !matches!(
+                task.status,
+                TaskStatus::Indexed | TaskStatus::Failed | TaskStatus::Cancelled
+            ) {
+                return true;
+            }
+            task.completed_at
+                .map(|completed| completed >= cutoff)
+                .unwrap_or(true)
+        });
+        Ok((before - tasks.len()) as u64)
     }
 }
 

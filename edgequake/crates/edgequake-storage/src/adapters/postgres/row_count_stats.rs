@@ -1,6 +1,11 @@
 //! Maintained row counters for O(1) `count()` on large PostgreSQL tables.
 //!
-//! SPEC-011 / SPEC-012: stats table + INSERT/DELETE triggers.
+//! SPEC-011 / SPEC-012 / SPEC-090: stats table + INSERT/DELETE triggers.
+//!
+//! ## SPEC-090 F-090-01
+//!
+//! Use `FOR EACH STATEMENT` triggers with transition tables so a batch INSERT of
+//! N rows performs **one** counter update (not N row locks on `id = 1`).
 //!
 //! ## search_path safety
 //!
@@ -98,14 +103,16 @@ pub async fn ensure_row_count_stats(pool: &PgPool, config: &RowCountStatsConfig<
     );
     sqlx::query(&backfill_sql).execute(&mut *tx).await.ok();
 
+    // SPEC-090: statement-level + transition tables (Postgres 10+).
+    // TG_OP / NEW/OLD are unavailable; transition relation names are bound in CREATE TRIGGER.
     let create_insert_fn = format!(
         r#"
         CREATE OR REPLACE FUNCTION public.{fn_insert}() RETURNS trigger AS $$
         BEGIN
             UPDATE {stats}
-            SET row_count = row_count + 1
+            SET row_count = row_count + (SELECT COUNT(*)::bigint FROM inserted)
             WHERE id = 1;
-            RETURN NEW;
+            RETURN NULL;
         END;
         $$ LANGUAGE plpgsql
         "#,
@@ -127,9 +134,12 @@ pub async fn ensure_row_count_stats(pool: &PgPool, config: &RowCountStatsConfig<
         CREATE OR REPLACE FUNCTION public.{fn_delete}() RETURNS trigger AS $$
         BEGIN
             UPDATE {stats}
-            SET row_count = GREATEST(row_count - 1, 0)
+            SET row_count = GREATEST(
+                row_count - (SELECT COUNT(*)::bigint FROM deleted),
+                0
+            )
             WHERE id = 1;
-            RETURN OLD;
+            RETURN NULL;
         END;
         $$ LANGUAGE plpgsql
         "#,
@@ -157,7 +167,8 @@ pub async fn ensure_row_count_stats(pool: &PgPool, config: &RowCountStatsConfig<
         r#"
         CREATE TRIGGER {trigger_insert}
         AFTER INSERT ON {table}
-        FOR EACH ROW EXECUTE FUNCTION public.{fn_insert}()
+        REFERENCING NEW TABLE AS inserted
+        FOR EACH STATEMENT EXECUTE FUNCTION public.{fn_insert}()
         "#,
         trigger_insert = trigger_insert,
         table = config.table_name,
@@ -184,7 +195,8 @@ pub async fn ensure_row_count_stats(pool: &PgPool, config: &RowCountStatsConfig<
         r#"
         CREATE TRIGGER {trigger_delete}
         AFTER DELETE ON {table}
-        FOR EACH ROW EXECUTE FUNCTION public.{fn_delete}()
+        REFERENCING OLD TABLE AS deleted
+        FOR EACH STATEMENT EXECUTE FUNCTION public.{fn_delete}()
         "#,
         trigger_delete = trigger_delete,
         table = config.table_name,
@@ -208,4 +220,21 @@ pub async fn ensure_row_count_stats(pool: &PgPool, config: &RowCountStatsConfig<
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_names_are_stable() {
+        let c = RowCountStatsConfig {
+            prefix: "eq_default",
+            table_name: "eq_default_vectors",
+            stats_table_name: "eq_default_vectors_stats",
+            kind: "vectors",
+        };
+        assert_eq!(c.trigger_insert(), "eq_eq_default_vectors_stats_insert_trg");
+        assert!(c.fn_insert().contains("stats_insert"));
+    }
 }

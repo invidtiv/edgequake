@@ -328,7 +328,10 @@ fn spec027_migration_046_startup_reconcile_wired() {
     assert!(bootstrap.contains("migration_046"));
     assert!(std::path::Path::new("src/state/migration_bootstrap/reconcile/m046.rs").exists());
     let postgres = read_crate_src("src/state/postgres.rs");
-    assert!(postgres.contains("run_postgres_migrations"));
+    assert!(
+        postgres.contains("bootstrap_for_serving") || postgres.contains("run_postgres_migrations"),
+        "postgres boot must call bootstrap_for_serving / run_postgres_migrations (SPEC-090)"
+    );
 }
 
 #[test]

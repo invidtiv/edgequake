@@ -93,25 +93,53 @@ impl Default for PostgresConfig {
             ssl_mode: SslMode::Prefer,
             vector_index_type: VectorIndexType::HNSW,
             hnsw_m: 16,
-            // Default 64 = pgvector HNSW default (SPEC-058). Production: set
-            // EDGEQUAKE_HNSW_EF_CONSTRUCTION=128. Never REINDEX on boot —
-            // operator-driven only.
+            // Default 128 (SPEC-090 F-090-24/25). Override via EDGEQUAKE_HNSW_EF_CONSTRUCTION.
+            // Never REINDEX on boot — operator-driven only.
             hnsw_ef_construction: hnsw_ef_construction_from_env(),
             ivfflat_lists: 100,
         }
     }
 }
 
-/// HNSW `ef_construction` from env (default **64** = pgvector upstream default).
+/// HNSW `ef_construction` from env (default **128**, SPEC-090 F-090-24/25).
 ///
-/// Production recommendation (July 2026): **128**. Changing this only affects
-/// **new** index builds — existing HNSW requires operator `REINDEX CONCURRENTLY`.
+/// Changing this only affects **new** index builds — existing HNSW requires
+/// operator `REINDEX CONCURRENTLY`.
 pub fn hnsw_ef_construction_from_env() -> u32 {
     std::env::var("EDGEQUAKE_HNSW_EF_CONSTRUCTION")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .map(|v| v.clamp(4, 1000))
-        .unwrap_or(64)
+        .unwrap_or(128)
+}
+
+/// Optional single-process role label (legacy). Prefer [`crate::PgPoolBundle`].
+///
+/// `EDGEQUAKE_DB_POOL_ROLE=query|ingest|queue|admin` — when set with a matching
+/// `EDGEQUAKE_DB_POOL_SIZE_{ROLE}` override, adjusts `max_connections` for
+/// a single-pool process. In-server multi-pool uses `PgPoolBundle` instead.
+pub fn db_pool_role_from_env() -> Option<String> {
+    std::env::var("EDGEQUAKE_DB_POOL_ROLE")
+        .ok()
+        .map(|r| r.to_ascii_lowercase())
+        .filter(|r| matches!(r.as_str(), "query" | "ingest" | "queue" | "admin"))
+}
+
+/// Resolve pool size: role-specific override, else configured default.
+pub fn resolve_pool_max_connections(default: u32) -> u32 {
+    let override_env = db_pool_role_from_env().and_then(|role| {
+        let key = match role.as_str() {
+            "query" => "EDGEQUAKE_DB_POOL_SIZE_QUERY",
+            "ingest" => "EDGEQUAKE_DB_POOL_SIZE_INGEST",
+            "queue" => "EDGEQUAKE_DB_POOL_SIZE_QUEUE",
+            "admin" => "EDGEQUAKE_DB_POOL_SIZE_ADMIN",
+            _ => return None,
+        };
+        std::env::var(key).ok()
+    });
+    override_env
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]
@@ -125,11 +153,11 @@ mod hnsw_ef_construction_tests {
     }
 
     #[test]
-    fn default_is_64_when_unset() {
+    fn default_is_128_when_unset() {
         let _g = env_lock().lock().unwrap();
         let prev = std::env::var("EDGEQUAKE_HNSW_EF_CONSTRUCTION").ok();
         std::env::remove_var("EDGEQUAKE_HNSW_EF_CONSTRUCTION");
-        assert_eq!(hnsw_ef_construction_from_env(), 64);
+        assert_eq!(hnsw_ef_construction_from_env(), 128);
         match prev {
             Some(v) => std::env::set_var("EDGEQUAKE_HNSW_EF_CONSTRUCTION", v),
             None => std::env::remove_var("EDGEQUAKE_HNSW_EF_CONSTRUCTION"),

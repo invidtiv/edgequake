@@ -209,15 +209,6 @@ impl PostgresAGEGraphStorage {
             StorageError::Connection(format!("Failed to acquire connection: {}", e))
         })?;
 
-        // WHY: Build SQL IN clause using escaped string literals to avoid the AGE Cypher
-        // overhead. This is the same pattern as `get_popular_nodes_with_degree` — native
-        // SQL with direct table access. `escape_sql_string` uses '' (not \') for safety.
-        let ids_list: Vec<String> = node_ids
-            .iter()
-            .map(|id| format!("'{}'", Self::escape_sql_string(id)))
-            .collect();
-        let ids_str = ids_list.join(", ");
-
         // WHY: Tenant/workspace filters — legacy NULL-as-wildcard for pre-multitenancy edges.
         let edge_filter = EdgeListFilter {
             tenant_id: tenant_id.map(str::to_string),
@@ -230,30 +221,37 @@ impl PostgresAGEGraphStorage {
             EdgeTenantFilterMode::LegacyNullAsWildcard,
         );
 
+        // SPEC-090 F-090-10: bind `= ANY($1::text[])` (referenced twice) so the plan
+        // cache is stable and string interpolation is not the injection defense.
         // Native SQL: filter on edge properties directly.
-        // `source_id` and `target_id` are stored in edge properties (not vertex joins needed).
         // Migration 036 adds expression indexes on these properties for fast lookups.
         let sql = format!(
             r#"SELECT ag_catalog.agtype_to_json(e.properties) AS edge_props
                FROM {}."_ag_label_edge" e
-               WHERE ag_catalog.agtype_to_json(e.properties)->>'source_id' IN ({})
-                 AND ag_catalog.agtype_to_json(e.properties)->>'target_id' IN ({})
+               WHERE ag_catalog.agtype_to_json(e.properties)->>'source_id' = ANY($1::text[])
+                 AND ag_catalog.agtype_to_json(e.properties)->>'target_id' = ANY($1::text[])
                  {}"#,
-            self.graph_name, ids_str, ids_str, extra_where
+            self.graph_name, extra_where
         );
 
-        // WHY: No LOAD 'age' / search_path required for native SQL on AGE tables.
-        // The ag_catalog.agtype_to_json function is callable from any search_path
-        // when the schema is fully qualified.
-        sqlx::query("SET search_path = ag_catalog, \"$user\", public")
-            .execute(&mut *conn)
-            .await
-            .map_err(|e| StorageError::Database(format!("Failed to set search_path: {}", e)))?;
-
         // SPEC-089 Wave 3 / F-336-10: PG kill aligned with run_timed_graph_query.
+        // SPEC-090 F-090-07: SET LOCAL search_path inside the timed txn (no leak).
         let timeout_ms = super::super::helpers::graph_query_statement_timeout_ms();
         let mut timed = super::super::helpers::LocalTimeoutTx::begin(&mut conn, timeout_ms).await?;
-        let rows = match sqlx::query(&sql).fetch_all(&mut **timed.as_mut()).await {
+        if let Err(e) = sqlx::query("SET LOCAL search_path TO ag_catalog, \"$user\", public")
+            .execute(&mut **timed.as_mut())
+            .await
+        {
+            let _ = timed.rollback().await;
+            return Err(StorageError::Database(format!(
+                "Failed to set LOCAL search_path: {e}"
+            )));
+        }
+        let rows = match sqlx::query(&sql)
+            .bind(node_ids)
+            .fetch_all(&mut **timed.as_mut())
+            .await
+        {
             Ok(r) => {
                 timed.commit().await?;
                 r

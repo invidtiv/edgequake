@@ -85,9 +85,8 @@ fn iss089_storage_count_uses_statement_timeout() {
         edges.contains("pg_get_incident_edges_batch") && edges.contains("LocalTimeoutTx"),
         "BFS incident edges batch must use LocalTimeoutTx (F-336-15)"
     );
-    let stmt_to = include_str!(
-        "../../edgequake-storage/src/adapters/postgres/graph/helpers/statement_timeout.rs"
-    );
+    let stmt_to =
+        include_str!("../../edgequake-storage/src/adapters/postgres/statement_timeout.rs");
     assert!(
         stmt_to.contains("GRAPH_QUERY_PG_HEADROOM_MS") && stmt_to.contains("saturating_sub"),
         "graph PG timeout must be under app budget (LAW-H2)"

@@ -20,6 +20,23 @@ pub trait TaskStorage: Send + Sync {
     /// Update existing task
     async fn update_task(&self, task: &Task) -> TaskResult<()>;
 
+    /// SPEC-090 F-090-04: update only `progress` + `updated_at` (no payload rewrite).
+    ///
+    /// Default falls back to get+update_task (memory / legacy adapters).
+    async fn update_task_progress(
+        &self,
+        track_id: &str,
+        progress: &crate::types::TaskProgress,
+    ) -> TaskResult<()> {
+        if let Some(mut task) = self.get_task(track_id).await? {
+            task.progress = Some(progress.clone());
+            task.updated_at = Utc::now();
+            self.update_task(&task).await
+        } else {
+            Err(crate::error::TaskError::TaskNotFound(track_id.to_string()))
+        }
+    }
+
     /// Lightweight heartbeat: update only the `updated_at` timestamp.
     ///
     /// WHY: Workers call this periodically during long-running processing
@@ -161,6 +178,12 @@ pub trait TaskStorage: Send + Sync {
         Ok(None)
     }
 
+    /// Delete terminal tasks older than `older_than_days` (SPEC-090 F-090-13).
+    ///
+    /// Removes rows in `indexed`, `failed`, or `cancelled` status whose
+    /// `completed_at` is older than the cutoff. Returns the number of rows deleted.
+    async fn prune_terminal_tasks(&self, older_than_days: u32) -> TaskResult<u64>;
+
     /// Find an in-flight Insert (KG ingest) for the same PDF (SPEC-057 P2).
     async fn find_active_pdf_ingest_task(
         &self,
@@ -220,6 +243,11 @@ pub struct Pagination {
     pub page_size: u32,
     pub sort_by: SortField,
     pub order: SortOrder,
+    /// Keyset cursor: return rows strictly after this `(created_at, track_id)` tuple.
+    ///
+    /// SPEC-090 F-090-14: prefer keyset over OFFSET when callers supply a cursor.
+    pub after_created_at: Option<DateTime<Utc>>,
+    pub after_track_id: Option<String>,
 }
 
 impl Default for Pagination {
@@ -229,19 +257,28 @@ impl Default for Pagination {
             page_size: 20,
             sort_by: SortField::CreatedAt,
             order: SortOrder::Desc,
+            after_created_at: None,
+            after_track_id: None,
         }
     }
 }
 
+impl Pagination {
+    /// Whether keyset pagination should be used instead of OFFSET.
+    pub fn has_keyset_cursor(&self) -> bool {
+        self.after_created_at.is_some() && self.after_track_id.is_some()
+    }
+}
+
 /// Sort field enum
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortField {
     CreatedAt,
     UpdatedAt,
 }
 
 /// Sort order enum
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortOrder {
     Asc,
     Desc,

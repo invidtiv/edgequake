@@ -904,6 +904,30 @@ impl WorkerPool {
                 }
             });
         }
+
+        // SPEC-090 F-090-13: prune terminal tasks on an idle tick (retention env).
+        let prune_storage = Arc::clone(&self.storage);
+        runtime.spawn(async move {
+            let retention_days = crate::config::task_retention_days_from_env();
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_secs(3600)).await;
+                match prune_storage.prune_terminal_tasks(retention_days).await {
+                    Ok(n) if n > 0 => {
+                        info!(
+                            deleted = n,
+                            retention_days, "SPEC-090: pruned terminal tasks"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(
+                            error.message = %e,
+                            "SPEC-090: prune_terminal_tasks failed"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Shutdown the worker pool gracefully within the drain budget (SPEC-083 X-31).

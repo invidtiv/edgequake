@@ -4111,6 +4111,7 @@ export interface components {
          * @description Component health status.
          * @example {
          *       "eq_id_schema": {},
+         *       "graph_available": {},
          *       "graph_storage": {},
          *       "kv_storage": {},
          *       "llm_provider": {},
@@ -4125,6 +4126,8 @@ export interface components {
              *     Liveness `/health` stays HTTP 200 with `status: degraded`.
              */
             eq_id_schema?: boolean | null;
+            /** @description Apache AGE extension available (PostgreSQL only, SPEC-090 F-090-19). */
+            graph_available?: boolean | null;
             /** @description Graph storage status. */
             graph_storage: boolean;
             /** @description KV storage status. */
@@ -7568,6 +7571,8 @@ export interface components {
         /**
          * @description Query parameters for listing tasks.
          * @example {
+         *       "after_created_at": {},
+         *       "after_track_id": {},
          *       "order": {},
          *       "page": {},
          *       "page_size": {},
@@ -7579,6 +7584,10 @@ export interface components {
          *     }
          */
         ListTasksQuery: {
+            /** @description SPEC-090 F-090-14: keyset cursor — ISO-8601 `created_at` after which to continue. */
+            after_created_at?: string | null;
+            /** @description SPEC-090 F-090-14: keyset cursor — `track_id` tie-break with `after_created_at`. */
+            after_track_id?: string | null;
             /** @description Sort order (asc, desc). */
             order?: string | null;
             /**

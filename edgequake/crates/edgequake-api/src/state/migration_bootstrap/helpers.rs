@@ -36,30 +36,9 @@ pub(super) fn quote_schema(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// Compare dotted semver-like extension versions (e.g. `0.8.3`, `1.6.0`).
+/// Compare dotted semver-like extension versions (delegates to storage SSOT).
 pub fn extension_version_at_least(version: &str, minimum: &str) -> bool {
-    let parse = |v: &str| -> Vec<u32> {
-        v.split(|c: char| !c.is_ascii_digit())
-            .filter(|s| !s.is_empty())
-            .filter_map(|s| s.parse().ok())
-            .collect()
-    };
-    let va = parse(version);
-    let vb = parse(minimum);
-    if va.is_empty() {
-        return false;
-    }
-    for i in 0..vb.len().max(va.len()) {
-        let a = va.get(i).copied().unwrap_or(0);
-        let b = vb.get(i).copied().unwrap_or(0);
-        if a > b {
-            return true;
-        }
-        if a < b {
-            return false;
-        }
-    }
-    true
+    edgequake_storage::adapters::postgres::extension_version_at_least(version, minimum)
 }
 
 /// Return true if pgvector `extversion` is >= 0.8.0 (iterative-scan GUCs).

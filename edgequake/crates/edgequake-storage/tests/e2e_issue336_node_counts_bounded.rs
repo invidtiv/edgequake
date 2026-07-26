@@ -21,6 +21,10 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+
+/// Serializes tests that observe `SOURCE_PREFIX_DISCOVERY_CALLS` (process-global).
+static DISCOVERY_CALLS_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn node_props(id: &str, prefix: &str) -> (String, HashMap<String, serde_json::Value>) {
     let mut props = HashMap::new();
@@ -250,6 +254,8 @@ async fn issue336_discovery_timeout_keeps_pool_usable() {
 
     let filter = NodeListFilter::default();
     let start = Instant::now();
+    // Hold discovery lock so phase4 call-count assert cannot race this storm.
+    let _discovery_guard = DISCOVERY_CALLS_LOCK.lock().await;
     let mut handles = Vec::new();
     for _ in 0..8 {
         let g = Arc::clone(&graph);
@@ -262,6 +268,7 @@ async fn issue336_discovery_timeout_keeps_pool_usable() {
     for h in handles {
         let _ = h.await;
     }
+    drop(_discovery_guard);
     assert!(
         start.elapsed() < Duration::from_secs(20),
         "discovery storms must finish under statement_timeout budget"
@@ -290,7 +297,7 @@ fn iss089_source_constants_visible_in_helpers() {
     assert!(src.contains("WORKSPACE_STATS_STATEMENT_TIMEOUT_MS: u32 = 3_750"));
     assert!(src.contains("CROSS JOIN generate_series"));
     assert!(src.contains("MATERIALIZED"));
-    let helper = include_str!("../src/adapters/postgres/graph/helpers/statement_timeout.rs");
+    let helper = include_str!("../src/adapters/postgres/statement_timeout.rs");
     assert!(helper.contains("LocalTimeoutTx"));
     assert!(helper.contains("SET LOCAL statement_timeout"));
     assert!(helper.contains("interactive_statement_timeout_ms"));
@@ -312,8 +319,9 @@ async fn iss089_phase4_single_cascade_discovery_is_one_pair() {
         .await
         .expect("upsert");
 
-    SOURCE_PREFIX_DISCOVERY_CALLS.store(0, Ordering::SeqCst);
     let prefixes = vec![prefix.to_string(), "iss089-phase4-doc".to_string()];
+    let _discovery_guard = DISCOVERY_CALLS_LOCK.lock().await;
+    let before = SOURCE_PREFIX_DISCOVERY_CALLS.load(Ordering::SeqCst);
     let _ = graph
         .find_nodes_by_source_prefixes(&NodeListFilter::default(), &prefixes)
         .await
@@ -322,7 +330,8 @@ async fn iss089_phase4_single_cascade_discovery_is_one_pair() {
         .find_edges_by_source_prefixes(&EdgeListFilter::default(), &prefixes)
         .await
         .expect("edges");
-    let calls = SOURCE_PREFIX_DISCOVERY_CALLS.load(Ordering::SeqCst);
+    let calls = SOURCE_PREFIX_DISCOVERY_CALLS.load(Ordering::SeqCst) - before;
+    drop(_discovery_guard);
     assert_eq!(
         calls, 2,
         "F-336-12: one cascade = 1 node discovery + 1 edge discovery, got {calls}"

@@ -7,6 +7,7 @@
 use sqlx::PgPool;
 use tracing::{info, warn};
 
+use super::super::reconcile_state::{record_reconcile_state, sha384_hex};
 use super::super::{Migration092Report, SQL_092_APPLY};
 use super::execute_bootstrap_apply_sql;
 
@@ -52,7 +53,9 @@ pub async fn reconcile_migration_092(pool: &PgPool) -> Result<Migration092Report
         maintenance,
         "Reconciling eq_* denorm schema on all AGE graphs (M092 / SPEC-069)"
     );
+    let apply_started = std::time::Instant::now();
     execute_bootstrap_apply_sql(pool, &apply_sql).await?;
+    let apply_ms = apply_started.elapsed().as_millis() as i64;
 
     // Only score graphs that already have AGE child Node+EDGE tables. Incomplete
     // stubs (e.g. leftover bind_probe*) match support/092 CONTINUE — not degraded.
@@ -92,6 +95,28 @@ pub async fn reconcile_migration_092(pool: &PgPool) -> Result<Migration092Report
             degraded = ?graphs_degraded,
             ready = graphs_ready,
             "eq_* columns still missing after reconcile — /ready will fail unless EDGEQUAKE_EQ_ID_FALLBACK=1"
+        );
+    }
+
+    let outcome = if graphs_degraded.is_empty() {
+        "ok"
+    } else {
+        "degraded"
+    };
+    if let Err(e) = record_reconcile_state(
+        pool,
+        "092",
+        &sha384_hex(SQL_092_APPLY.as_bytes()),
+        Some(apply_ms),
+        outcome,
+    )
+    .await
+    {
+        warn!(
+            target: "edgequake.migration",
+            step = "migration_092_reconcile_state",
+            error = %e,
+            "Failed to record reconcile state (non-fatal)"
         );
     }
 

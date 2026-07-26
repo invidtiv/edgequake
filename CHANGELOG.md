@@ -6,6 +6,44 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [0.22.0] — 2026-07-26
+
+Minor: SPEC-090 performance audit closeout — multi-pool, migrate CLI, schema cutovers (M104/M105), boot migrate split.
+
+### Added
+
+- **`PgPoolBundle`** — in-process query / ingest / queue / admin pools with per-role sizes (`EDGEQUAKE_DB_POOL_SIZE_*`) and acquire timeouts; optional `DATABASE_READ_URL` for the query pool.
+- **`edgequake migrate`** — admin-pool sqlx migrate + support reconcile with operator stdout (preflight, applied list, tasks/PDF/HNSW probes).
+- **M104** — monthly range-partitioned `tasks` + `edgequake_ensure_tasks_month_partitions` / detach helpers; `eq_hot_ann_workspaces` registry.
+- **M105** — PDF bytes SSOT in `pdf_document_blobs`; drops `pdf_documents.pdf_data`.
+- **HNSW mutual exclusion** — hot workspaces get partial HNSW; global index rebuilt excluding hot WS rows.
+- **HNSW index manifest** — `check_hnsw_index_manifest` (m=16, ef_construction default 128) at migrate/boot.
+- **Embedding identity** — `embedding_model` / `embedding_dim` / `embedding_norm` columns + metadata on vector upsert; dimension change remains fail-closed (`EDGEQUAKE_ALLOW_VECTOR_TABLE_REBUILD` escape).
+- **Progress-only updates** — `update_task_progress` wired on hot processor ticks (no full JSONB payload rewrite).
+- **SPEC-090 pack** — [`specs/090-performance/`](specs/090-performance/) + measurements `2026-07-26-after-full-closeout.md`; `e2e_spec090_*` / multi-pool isolation tests; smoke includes SPEC-089 regressions.
+
+### Changed
+
+- **Serving boot** — `bootstrap_for_serving` refuses pending sqlx migrations unless `EDGEQUAKE_ALLOW_BOOT_MIGRATE=1` or `EDGEQUAKE_MIGRATE_CLI=1`; heavy `execute_bootstrap_apply_sql` gated the same way. `make backend-bg` defaults `EDGEQUAKE_ALLOW_BOOT_MIGRATE=1`.
+- **PDF create/get** — writes/reads blob side-table only (post-M105).
+- **DDL session GUCs** — prefer `SET LOCAL` inside TX; CIC path keeps session `SET` + pool `DISCARD ALL`.
+
+### Fixed
+
+- SPEC-090 findings F-090-01…32 (see [`specs/090-performance/01-finding-register.md`](specs/090-performance/01-finding-register.md)), including UNION-ctid relation deletes, claim/prune bounds, and AGE init fail-closed.
+
+### Docs
+
+- Release pin **v0.22.0**; migrate / multi-pool notes in README; ops release-and-cd examples updated.
+
+### GUARD residuals
+
+- Additive binary+float HNSW unless `EDGEQUAKE_BINARY_QUANTIZE=1` with recall gate.
+- True remote replica operations require operator-managed `DATABASE_READ_URL`.
+- S3 PDF storage, HASH-partitioned vector tables, DiskANN product cutover remain out of scope.
+
+---
+
 ## [0.21.3] — 2026-07-25
 
 Patch: SPEC-089 / [#336](https://github.com/raphaelmansuy/edgequake/issues/336) — pool-safe health under large corpora; SPEC-088 list-surface delete hardening.

@@ -1,6 +1,7 @@
 # SPEC-088 Phase 5–6 — Improvements: done & proved
 
 **Status:** Phase 6 **complete** for recommended request-path work (2026-07-25).  
+**Follow-on:** [SPEC-090 performance](../../specs/090-performance/README.md) — counter serialization, claim_next O(N), PDF list TOAST, pool GUC leak, halfvec default (Waves 0–4 landed 2026-07-26; RCA cross-ref `specs/090-performance/00-why.md`).  
 **First-principles goal:** every request-path data access is **index-backed** and
 **batch-collapsible** so asymptotic cost is **O(K log N)** (or better), never
 **O(N)** full scans or **O(K) network RTs**.

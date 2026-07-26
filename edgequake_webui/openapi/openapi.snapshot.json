@@ -9,7 +9,7 @@
     "license": {
       "name": "Apache-2.0"
     },
-    "version": "0.21.3"
+    "version": "0.22.0"
   },
   "servers": [
     {
@@ -2945,8 +2945,8 @@
             "workspace_id": []
           }
         ],
-        "x-edgequake-v2-catalog": "/api/v2/workspaces/{workspace_id}/jobs/catalog",
-        "x-edgequake-v2-job-type": "reprocess_failed"
+        "x-edgequake-v2-job-type": "reprocess_failed",
+        "x-edgequake-v2-catalog": "/api/v2/workspaces/{workspace_id}/jobs/catalog"
       }
     },
     "/api/v1/documents/scan": {
@@ -8651,8 +8651,8 @@
             "workspace_id": []
           }
         ],
-        "x-edgequake-v2-catalog": "/api/v2/workspaces/{workspace_id}/jobs/catalog",
-        "x-edgequake-v2-job-type": "reprocess_all"
+        "x-edgequake-v2-job-type": "reprocess_all",
+        "x-edgequake-v2-catalog": "/api/v2/workspaces/{workspace_id}/jobs/catalog"
       }
     },
     "/api/v1/workspaces/{workspace_id}/stats": {
@@ -10831,6 +10831,13 @@
             ],
             "description": "SPEC-083 / P0: AGE `eq_*` denorm columns ready (or fallback env enabled).\n\nWhen false, `/ready` refuses traffic unless `EDGEQUAKE_EQ_ID_FALLBACK=1`.\nLiveness `/health` stays HTTP 200 with `status: degraded`."
           },
+          "graph_available": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Apache AGE extension available (PostgreSQL only, SPEC-090 F-090-19)."
+          },
           "graph_storage": {
             "type": "boolean",
             "description": "Graph storage status."
@@ -10850,6 +10857,7 @@
         },
         "example": {
           "eq_id_schema": {},
+          "graph_available": {},
           "graph_storage": {},
           "kv_storage": {},
           "llm_provider": {},
@@ -17566,6 +17574,20 @@
         "type": "object",
         "description": "Query parameters for listing tasks.",
         "properties": {
+          "after_created_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SPEC-090 F-090-14: keyset cursor — ISO-8601 `created_at` after which to continue."
+          },
+          "after_track_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SPEC-090 F-090-14: keyset cursor — `track_id` tie-break with `after_created_at`."
+          },
           "order": {
             "type": [
               "string",
@@ -17628,6 +17650,8 @@
           }
         },
         "example": {
+          "after_created_at": {},
+          "after_track_id": {},
           "order": {},
           "page": {},
           "page_size": {},
@@ -26759,7 +26783,7 @@
     "asyncapi": "2.6.0",
     "info": {
       "title": "EdgeQuake WebSocket Progress",
-      "version": "0.21.3",
+      "version": "0.22.0",
       "description": "Real-time pipeline and document processing progress over WebSocket (RFC 6455)."
     },
     "defaultContentType": "application/json",

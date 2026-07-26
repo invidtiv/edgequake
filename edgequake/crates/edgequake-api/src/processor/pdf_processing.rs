@@ -324,12 +324,14 @@ impl DocumentTaskProcessor {
             extraction_warning,
         );
 
-        task.update_progress("enqueue_ingest".to_string(), 5, 90);
+        self.bump_task_progress(task, "enqueue_ingest".to_string(), 5, 90)
+            .await;
         let ingest_track_id = self
             .enqueue_pdf_ingest_insert(task, data, text_data, ingest_timeout_secs)
             .await?;
 
-        task.update_progress("complete".to_string(), 6, 100);
+        self.bump_task_progress(task, "complete".to_string(), 6, 100)
+            .await;
         info!(
             pdf_id = %data.pdf_id,
             document_id = %early_doc_id,
@@ -457,7 +459,8 @@ impl DocumentTaskProcessor {
             .map_err(|e| edgequake_tasks::TaskError::Storage(e.to_string()))?;
 
         // == Progress: loading complete, preparing for conversion ==
-        task.update_progress("pdf_loading".to_string(), 1, 5);
+        self.bump_task_progress(task, "pdf_loading".to_string(), 1, 5)
+            .await;
 
         let tenant_ctx = crate::middleware::TenantContext {
             tenant_id: Some(data.tenant_id.to_string()),
@@ -637,7 +640,8 @@ impl DocumentTaskProcessor {
                         "RESUME: Markdown already stored — skipping PDF conversion, enqueueing ingest Insert"
                     );
 
-                    task.update_progress("resume_convert_barrier".to_string(), 3, 45);
+                    self.bump_task_progress(task, "resume_convert_barrier".to_string(), 3, 45)
+                        .await;
 
                     self.check_cancelled(&cancel_token, "pre-ingest-enqueue-resume", &early_doc_id)
                         .await?;
@@ -722,7 +726,8 @@ impl DocumentTaskProcessor {
         }
 
         // == Progress: starting conversion (this can take 5-10+ minutes) ==
-        task.update_progress("pdf_converting".to_string(), 2, 10);
+        self.bump_task_progress(task, "pdf_converting".to_string(), 2, 10)
+            .await;
 
         // ── CANCELLATION GATE: before vision extraction (most expensive PDF stage) ──
         self.check_cancelled(&cancel_token, "pre-vision-extraction", &early_doc_id)
@@ -1305,7 +1310,8 @@ impl DocumentTaskProcessor {
         );
 
         // == Progress: conversion done, storing markdown ==
-        task.update_progress("storing_markdown".to_string(), 3, 45);
+        self.bump_task_progress(task, "storing_markdown".to_string(), 3, 45)
+            .await;
 
         // 5. Store markdown in pdf_documents (convert barrier SSOT — SPEC-057 P2)
         let update_req = UpdatePdfProcessingRequest {

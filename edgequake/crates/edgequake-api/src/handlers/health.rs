@@ -96,10 +96,19 @@ pub async fn health_check(State(state): State<AppState>) -> ApiResult<Json<Healt
     #[cfg(not(feature = "postgres"))]
     let eq_id_schema = None;
 
+    #[cfg(feature = "postgres")]
+    let graph_available = state
+        .migration_bootstrap
+        .as_ref()
+        .map(|r| r.migration_092.age_available);
+    #[cfg(not(feature = "postgres"))]
+    let graph_available = None;
+
     let components = ComponentHealth {
         kv_storage: kv_ok,
         vector_storage: vector_ok,
         graph_storage: graph_ok,
+        graph_available,
         llm_provider: true, // Assume available, actual check would require API call
         eq_id_schema,
     };
@@ -508,12 +517,19 @@ pub async fn readiness_check(State(state): State<AppState>) -> impl IntoResponse
 
         // SPEC-057 P3: store contention (pool util + compensation quarantine).
         // DRY: reuse readiness_blocked_by_store / assess_store_contention SSOT.
-        let pool_util = state.pg_pool.as_ref().and_then(|pool| {
-            crate::store_contention::pool_utilization(
-                pool.size(),
-                pool.num_idle().min(u32::MAX as usize) as u32,
-            )
-        });
+        let pool_util = state
+            .pool_bundle
+            .as_ref()
+            .map(crate::store_contention::role_utils_from_bundle)
+            .and_then(|roles| crate::store_contention::max_role_pool_utilization(&roles))
+            .or_else(|| {
+                state.pg_pool.as_ref().and_then(|pool| {
+                    crate::store_contention::pool_utilization(
+                        pool.size(),
+                        pool.num_idle().min(u32::MAX as usize) as u32,
+                    )
+                })
+            });
         if crate::store_contention::readiness_blocked_by_store(pool_util) {
             let store = crate::store_contention::assess_store_contention(pool_util);
             ready = false;

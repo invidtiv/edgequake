@@ -44,7 +44,8 @@ impl DocumentTaskProcessor {
 
         match perform_document_deletion(state, &data, &tenant_ctx).await {
             Ok(result) => {
-                task.update_progress("deletion_complete".to_string(), 1, 100);
+                self.bump_task_progress(task, "deletion_complete".to_string(), 1, 100)
+                    .await;
                 Ok(serde_json::json!({
                     "document_id": data.document_id,
                     "chunks_deleted": result.chunks_deleted,

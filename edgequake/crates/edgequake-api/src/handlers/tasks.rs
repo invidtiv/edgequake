@@ -152,6 +152,13 @@ pub(crate) async fn list_tasks_response(
             .and_then(|t| parse_task_type(t).ok()),
     };
 
+    // SPEC-090 F-090-14: prefer keyset cursors when both after_* params present.
+    let after_created_at = params
+        .after_created_at
+        .as_deref()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&chrono::Utc));
+    let after_track_id = params.after_track_id.clone().filter(|s| !s.is_empty());
     let pagination = Pagination {
         page: params.page.unwrap_or(1),
         page_size: params.page_size.unwrap_or(20).min(100),
@@ -165,6 +172,8 @@ pub(crate) async fn list_tasks_response(
             .as_deref()
             .and_then(|o| parse_sort_order(o).ok())
             .unwrap_or(SortOrder::Desc),
+        after_created_at,
+        after_track_id,
     };
 
     let task_list = state

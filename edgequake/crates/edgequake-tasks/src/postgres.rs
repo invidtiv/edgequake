@@ -1,6 +1,8 @@
 //! PostgreSQL task storage implementation.
 
 #[cfg(feature = "postgres")]
+use crate::config::{task_max_workers_from_env, CLAIM_SAMPLE_LIMIT};
+#[cfg(feature = "postgres")]
 use crate::{
     error::{TaskError, TaskResult},
     storage::*,
@@ -22,7 +24,7 @@ const TASK_SELECT_COLUMNS: &str = r#"
     track_id, tenant_id, workspace_id, task_type, status, created_at, updated_at,
     started_at, completed_at, error_message, error, retry_count,
     max_retries, consecutive_timeout_failures, circuit_breaker_tripped,
-    payload, result, lease_owner, lease_token, lease_expires_at
+    payload, progress, result, lease_owner, lease_token, lease_expires_at, pdf_id
 "#;
 
 /// RETURNING list for `UPDATE tasks t … FROM candidate` — must qualify as `t.*`
@@ -32,8 +34,16 @@ const TASK_RETURNING_COLUMNS_ALIASED: &str = r#"
     t.track_id, t.tenant_id, t.workspace_id, t.task_type, t.status, t.created_at, t.updated_at,
     t.started_at, t.completed_at, t.error_message, t.error, t.retry_count,
     t.max_retries, t.consecutive_timeout_failures, t.circuit_breaker_tripped,
-    t.payload, t.result, t.lease_owner, t.lease_token, t.lease_expires_at
+    t.payload, t.progress, t.result, t.lease_owner, t.lease_token, t.lease_expires_at, t.pdf_id
 "#;
+
+#[cfg(feature = "postgres")]
+const LIST_STATEMENT_TIMEOUT_MS: u32 = 500;
+
+#[cfg(feature = "postgres")]
+fn pdf_id_column_value(task: &Task) -> Option<String> {
+    task.pdf_id().map(|id| id.to_string())
+}
 
 #[cfg(feature = "postgres")]
 fn task_from_row(row: &PgRow) -> TaskResult<Task> {
@@ -47,13 +57,17 @@ fn task_from_row(row: &PgRow) -> TaskResult<Task> {
             .get("metadata")
             .cloned()
             .and_then(|v| if v.is_null() { None } else { Some(v) });
-    let progress = payload.get("progress").cloned().and_then(|v| {
-        if v.is_null() {
-            None
-        } else {
-            serde_json::from_value(v).ok()
-        }
-    });
+    let progress = row
+        .get::<Option<serde_json::Value>, _>("progress")
+        .and_then(|v| if v.is_null() { None } else { Some(v) })
+        .or_else(|| payload.get("progress").cloned())
+        .and_then(|v| {
+            if v.is_null() {
+                None
+            } else {
+                serde_json::from_value(v).ok()
+            }
+        });
 
     Ok(Task {
         track_id: row.get("track_id"),
@@ -115,21 +129,23 @@ impl PostgresTaskStorage {
 #[async_trait::async_trait]
 impl TaskStorage for PostgresTaskStorage {
     async fn create_task(&self, task: &Task) -> TaskResult<()> {
-        // WHY: The database schema uses `payload` column (JSONB) to store task_data,
-        // metadata, and progress together. This is different from the Task struct
-        // which separates these fields. We combine them into payload for storage.
-        //
-        // Database columns (from migration):
-        // - payload: JSONB NOT NULL - stores task_data + metadata + progress
-        // - result: JSONB - stores result on completion
-        //
-        // This mapping allows the Task struct to maintain clean separation while
-        // the database uses a single JSONB column for flexibility.
+        // SPEC-090 F-090-13: ensure next monthly partitions exist (no-op if unpartitioned).
+        let _ = sqlx::query("SELECT edgequake_ensure_tasks_month_partitions()")
+            .execute(&*self.pool)
+            .await;
+
+        // SPEC-090 F-090-04: progress lives only in the column — never in payload.
         let payload = serde_json::json!({
             "task_data": task.task_data,
             "metadata": task.metadata,
-            "progress": task.progress,
         });
+        let progress_json = task
+            .progress
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| TaskError::StorageError(format!("Failed to serialize progress: {e}")))?;
+        let pdf_id = pdf_id_column_value(task);
 
         sqlx::query(
             r#"
@@ -137,8 +153,8 @@ impl TaskStorage for PostgresTaskStorage {
                 track_id, tenant_id, workspace_id, task_type, status, created_at, updated_at,
                 started_at, completed_at, error_message, error, retry_count,
                 max_retries, consecutive_timeout_failures, circuit_breaker_tripped,
-                payload, result, lease_owner, lease_token, lease_expires_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+                payload, progress, result, lease_owner, lease_token, lease_expires_at, pdf_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
             "#,
         )
         .bind(&task.track_id)
@@ -157,10 +173,12 @@ impl TaskStorage for PostgresTaskStorage {
         .bind(task.consecutive_timeout_failures)
         .bind(task.circuit_breaker_tripped)
         .bind(&payload)
+        .bind(&progress_json)
         .bind(&task.result)
         .bind(&task.lease_owner)
         .bind(task.lease_token)
         .bind(task.lease_expires_at)
+        .bind(&pdf_id)
         .execute(&*self.pool)
         .await
         .map_err(|e| TaskError::StorageError(format!("Failed to create task: {}", e)))?;
@@ -196,14 +214,42 @@ impl TaskStorage for PostgresTaskStorage {
         Ok(())
     }
 
+    async fn update_task_progress(
+        &self,
+        track_id: &str,
+        progress: &crate::types::TaskProgress,
+    ) -> TaskResult<()> {
+        let progress_json = serde_json::to_value(progress)
+            .map_err(|e| TaskError::StorageError(format!("Failed to serialize progress: {e}")))?;
+        let result = sqlx::query(
+            r#"
+            UPDATE tasks SET progress = $2, updated_at = NOW()
+            WHERE track_id = $1
+            "#,
+        )
+        .bind(track_id)
+        .bind(&progress_json)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| TaskError::StorageError(format!("Failed to update task progress: {e}")))?;
+        if result.rows_affected() == 0 {
+            return Err(TaskError::TaskNotFound(track_id.to_string()));
+        }
+        Ok(())
+    }
+
     async fn update_task(&self, task: &Task) -> TaskResult<()> {
-        // WHY: Update payload JSONB with combined task_data, metadata, progress
-        // We only update the progress inside payload on updates (task_data is immutable)
+        // SPEC-090 F-090-04: progress column is hot; payload omits progress on update.
         let payload = serde_json::json!({
             "task_data": task.task_data,
             "metadata": task.metadata,
-            "progress": task.progress,
         });
+        let progress_json = task
+            .progress
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|e| TaskError::StorageError(format!("Failed to serialize progress: {e}")))?;
 
         let result = sqlx::query(
             r#"
@@ -218,10 +264,11 @@ impl TaskStorage for PostgresTaskStorage {
                 consecutive_timeout_failures = $9,
                 circuit_breaker_tripped = $10,
                 payload = $11,
-                result = $12,
-                lease_owner = $13,
-                lease_token = $14,
-                lease_expires_at = $15
+                progress = $12,
+                result = $13,
+                lease_owner = $14,
+                lease_token = $15,
+                lease_expires_at = $16
             WHERE track_id = $1
             "#,
         )
@@ -236,6 +283,7 @@ impl TaskStorage for PostgresTaskStorage {
         .bind(task.consecutive_timeout_failures)
         .bind(task.circuit_breaker_tripped)
         .bind(&payload)
+        .bind(&progress_json)
         .bind(&task.result)
         .bind(&task.lease_owner)
         .bind(task.lease_token)
@@ -266,13 +314,10 @@ impl TaskStorage for PostgresTaskStorage {
     }
 
     async fn list_tasks(&self, filter: TaskFilter, pagination: Pagination) -> TaskResult<TaskList> {
-        // WHY: Query uses `payload` column instead of separate task_data, metadata, progress columns
-        // The payload JSONB contains all three fields combined
         let mut query = format!("SELECT {TASK_SELECT_COLUMNS} FROM tasks WHERE 1=1");
 
         let mut param_count = 0;
 
-        // CRITICAL: Filter by tenant_id and workspace_id for multi-tenancy isolation
         if filter.tenant_id.is_some() {
             param_count += 1;
             query.push_str(&format!(" AND tenant_id = ${}", param_count));
@@ -291,7 +336,28 @@ impl TaskStorage for PostgresTaskStorage {
             query.push_str(&format!(" AND task_type = ${}", param_count));
         }
 
-        // Add sorting
+        let keyset_created_at = pagination.after_created_at;
+        let keyset_track_id = pagination.after_track_id.as_deref().map(str::to_owned);
+        let use_keyset = pagination.has_keyset_cursor()
+            && pagination.sort_by == SortField::CreatedAt
+            && keyset_created_at.is_some()
+            && keyset_track_id.is_some();
+
+        if use_keyset {
+            param_count += 1;
+            let created_param = param_count;
+            param_count += 1;
+            let track_param = param_count;
+            match pagination.order {
+                SortOrder::Desc => query.push_str(&format!(
+                    " AND (created_at, track_id) < (${created_param}, ${track_param})"
+                )),
+                SortOrder::Asc => query.push_str(&format!(
+                    " AND (created_at, track_id) > (${created_param}, ${track_param})"
+                )),
+            }
+        }
+
         let sort_field = match pagination.sort_by {
             SortField::CreatedAt => "created_at",
             SortField::UpdatedAt => "updated_at",
@@ -300,19 +366,47 @@ impl TaskStorage for PostgresTaskStorage {
             SortOrder::Asc => "ASC",
             SortOrder::Desc => "DESC",
         };
-        query.push_str(&format!(" ORDER BY {} {}", sort_field, sort_order));
+        if pagination.sort_by == SortField::CreatedAt {
+            query.push_str(&format!(
+                " ORDER BY {sort_field} {sort_order}, track_id {sort_order}"
+            ));
+        } else {
+            query.push_str(&format!(" ORDER BY {sort_field} {sort_order}"));
+        }
 
-        // Add pagination
-        let offset = (pagination.page - 1) * pagination.page_size;
-        query.push_str(&format!(
-            " LIMIT {} OFFSET {}",
-            pagination.page_size, offset
-        ));
+        param_count += 1;
+        let limit_param = param_count;
+        query.push_str(&format!(" LIMIT ${limit_param}"));
 
-        // Execute query with dynamic binding
+        let offset = if use_keyset || pagination.page <= 1 {
+            0
+        } else {
+            (pagination.page - 1) * pagination.page_size
+        };
+        if offset > 0 {
+            param_count += 1;
+            let offset_param = param_count;
+            query.push_str(&format!(" OFFSET ${offset_param}"));
+        }
+
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            TaskError::StorageError(format!("Failed to acquire connection for list_tasks: {e}"))
+        })?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| TaskError::StorageError(format!("Failed to begin list_tasks txn: {e}")))?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{LIST_STATEMENT_TIMEOUT_MS}ms'"
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TaskError::StorageError(format!("Failed to set list_tasks statement_timeout: {e}"))
+        })?;
+
         let mut query_builder = sqlx::query(&query);
 
-        // Bind parameters in the same order as they appear in the query
         if let Some(tenant_id) = &filter.tenant_id {
             query_builder = query_builder.bind(tenant_id);
         }
@@ -325,19 +419,36 @@ impl TaskStorage for PostgresTaskStorage {
         if let Some(task_type) = &filter.task_type {
             query_builder = query_builder.bind(task_type.to_string());
         }
+        if use_keyset {
+            query_builder = query_builder
+                .bind(keyset_created_at.unwrap())
+                .bind(keyset_track_id.as_deref().unwrap());
+        }
+        query_builder = query_builder.bind(i64::from(pagination.page_size));
+        if offset > 0 {
+            query_builder = query_builder.bind(i64::from(offset));
+        }
 
-        let rows = query_builder
-            .fetch_all(&*self.pool)
-            .await
-            .map_err(|e| TaskError::StorageError(format!("Failed to list tasks: {}", e)))?;
+        let rows = match query_builder.fetch_all(&mut *tx).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(TaskError::StorageError(format!(
+                    "Failed to list tasks: {e}"
+                )));
+            }
+        };
+
+        tx.commit().await.map_err(|e| {
+            TaskError::StorageError(format!("Failed to commit list_tasks txn: {e}"))
+        })?;
 
         let tasks: Vec<Task> = rows
             .into_iter()
             .filter_map(|row| task_from_row(&row).ok())
             .collect();
 
-        // Get total count
-        let total = self.get_total_count(filter).await?;
+        let total = self.get_estimated_count(filter).await?;
         let total_pages = ((total as f64) / (pagination.page_size as f64)).ceil() as u32;
 
         Ok(TaskList {
@@ -464,19 +575,14 @@ impl TaskStorage for PostgresTaskStorage {
         workspace_id: uuid::Uuid,
     ) -> TaskResult<Option<Task>> {
         let pdf_id_str = pdf_id.to_string();
-        // SPEC-057 P2: Convert (`pdf_processing`) or follow-on Insert ingest.
         let sql = format!(
             r#"
             SELECT {TASK_SELECT_COLUMNS}
             FROM tasks
             WHERE workspace_id = $1
+              AND pdf_id = $2
               AND status IN ('pending', 'processing')
-              AND (
-                    (task_type = 'pdf_processing'
-                     AND payload->'task_data'->>'pdf_id' = $2)
-                 OR (task_type = 'insert'
-                     AND payload->'task_data'->'metadata'->>'pdf_id' = $2)
-              )
+              AND task_type IN ('pdf_processing', 'insert')
             ORDER BY created_at DESC
             LIMIT 1
             "#
@@ -507,9 +613,9 @@ impl TaskStorage for PostgresTaskStorage {
             SELECT {TASK_SELECT_COLUMNS}
             FROM tasks
             WHERE workspace_id = $1
+              AND pdf_id = $2
               AND task_type = 'insert'
               AND status IN ('pending', 'processing')
-              AND payload->'task_data'->'metadata'->>'pdf_id' = $2
             ORDER BY created_at DESC
             LIMIT 1
             "#
@@ -534,13 +640,13 @@ impl TaskStorage for PostgresTaskStorage {
      * @engine      postgres
      * @intent      Workspace-fair task claim with lease (SKIP LOCKED).
      * @tables      tasks
-     * @indexes     claim index on (status, workspace_id, created_at, lease_expires_at)
-     * @complexity  time: O(W + log N) fair pick + row lock; space: O(1)
-     * @limits      - Concurrent workers safe via FOR UPDATE SKIP LOCKED
+     * @indexes     idx_tasks_claim_pending_workspace_created, idx_tasks_stale_processing_lease
+     * @complexity  time: O(B + W) bounded sample B≈1000 + ws_load; space: O(1)
+     * @limits      - Concurrent workers safe via FOR UPDATE SKIP LOCKED (two sargable arms)
      *              - Lease TTL required; expired processing rows reclaimable
      *              - Deadlock risk if other paths lock tasks by track_id inconsistently
-     * @scaling     Contention rises with pending queue depth; fair WS ordering protects multi-tenant
-     * @tests       tests/data_layer/data_layer_limits.rs
+     * @scaling     Cost bounded by sample size, not full backlog depth (SPEC-090 F-090-11)
+     * @tests       tests/e2e_spec090_claim_bounded.rs, tests/postgres_claim_lease.rs
      * @pgversions  16: ok | 17: ok | 18: ok
      * @docs        specs/088-data-layer/postgres.md#data-pg-tasks-claim-next-140
      */
@@ -548,31 +654,36 @@ impl TaskStorage for PostgresTaskStorage {
         let lease_token = Uuid::new_v4();
         let lease_expires_at = crate::lease_expires_at(Utc::now(), lease_ttl);
 
-        // SPEC-084 / GH-316 / LAW-13 + IMP-140-02:
-        // Workspace-fair claim (least-loaded, then oldest) with SKIP LOCKED.
-        // Split status predicates (UNION ALL) so planner can use:
-        //   idx_tasks_claim_workspace_created (status, workspace_id, created_at)
-        //   idx_tasks_claimable_pending / idx_tasks_stale_processing_lease
-        // instead of a non-sargable OR across statuses.
-        // SPEC-088: DATA-PG-TASKS-CLAIM-NEXT-140
-        let sql = format!(
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            TaskError::StorageError(format!("Failed to acquire connection for claim_next: {e}"))
+        })?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| TaskError::StorageError(format!("Failed to begin claim_next txn: {e}")))?;
+
+        let fair_ws: Option<Uuid> = sqlx::query_scalar(
             r#"
-            /* DATA-PG-TASKS-CLAIM-NEXT-140 */
-            WITH pending AS (
+            /* DATA-PG-TASKS-CLAIM-NEXT-140 — bounded fair workspace pick */
+            WITH bounded_pending AS (
                 SELECT track_id, workspace_id, created_at
                 FROM tasks
                 WHERE status = 'pending'
+                ORDER BY created_at ASC
+                LIMIT $1
             ),
-            stale AS (
+            bounded_stale AS (
                 SELECT track_id, workspace_id, created_at
                 FROM tasks
                 WHERE status = 'processing'
                   AND (lease_expires_at IS NULL OR lease_expires_at < NOW())
+                ORDER BY created_at ASC
+                LIMIT $1
             ),
             claimable AS (
-                SELECT * FROM pending
+                SELECT * FROM bounded_pending
                 UNION ALL
-                SELECT * FROM stale
+                SELECT * FROM bounded_stale
             ),
             ws_load AS (
                 SELECT workspace_id, COUNT(*)::bigint AS active_count
@@ -581,51 +692,97 @@ impl TaskStorage for PostgresTaskStorage {
                   AND lease_expires_at IS NOT NULL
                   AND lease_expires_at >= NOW()
                 GROUP BY workspace_id
-            ),
-            fair_workspace AS (
-                SELECT c.workspace_id
-                FROM claimable c
-                LEFT JOIN ws_load w ON w.workspace_id = c.workspace_id
-                GROUP BY c.workspace_id
-                ORDER BY COALESCE(MAX(w.active_count), 0) ASC, MIN(c.created_at) ASC
-                LIMIT 1
-            ),
-            -- Single FOR UPDATE branch (PG forbids FOR UPDATE on UNION result).
-            -- Predicate order: workspace equality (from fair pick) + status sargable arms.
-            candidate AS (
-                SELECT t.track_id
-                FROM tasks t
-                INNER JOIN fair_workspace fw ON t.workspace_id = fw.workspace_id
-                WHERE t.status = 'pending'
-                   OR (
-                        t.status = 'processing'
-                        AND (t.lease_expires_at IS NULL OR t.lease_expires_at < NOW())
-                   )
-                ORDER BY t.created_at ASC
-                FOR UPDATE OF t SKIP LOCKED
-                LIMIT 1
             )
-            UPDATE tasks t
-            SET status = 'processing',
-                lease_owner = $1,
-                lease_token = $2,
-                lease_expires_at = $3,
-                started_at = COALESCE(t.started_at, NOW()),
-                updated_at = NOW(),
-                completed_at = NULL
-            FROM candidate
-            WHERE t.track_id = candidate.track_id
-            RETURNING {TASK_RETURNING_COLUMNS_ALIASED}
-            "#
-        );
+            SELECT c.workspace_id
+            FROM claimable c
+            LEFT JOIN ws_load w ON w.workspace_id = c.workspace_id
+            GROUP BY c.workspace_id
+            ORDER BY COALESCE(MAX(w.active_count), 0) ASC, MIN(c.created_at) ASC
+            LIMIT 1
+            "#,
+        )
+        .bind(CLAIM_SAMPLE_LIMIT)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| TaskError::StorageError(format!("Failed to pick fair workspace: {e}")))?;
 
-        let row = sqlx::query(&sql)
+        let Some(fair_ws) = fair_ws else {
+            let _ = tx.rollback().await;
+            return Ok(None);
+        };
+
+        // DRY: pending vs stale arms share the same UPDATE/RETURNING shape.
+        let claim_arm_sql = |candidate_where: &str| {
+            format!(
+                r#"
+                UPDATE tasks t
+                SET status = 'processing',
+                    lease_owner = $1,
+                    lease_token = $2,
+                    lease_expires_at = $3,
+                    started_at = COALESCE(t.started_at, NOW()),
+                    updated_at = NOW(),
+                    completed_at = NULL
+                FROM (
+                    SELECT track_id
+                    FROM tasks
+                    WHERE workspace_id = $4
+                      AND {candidate_where}
+                    ORDER BY created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                ) candidate
+                WHERE t.track_id = candidate.track_id
+                RETURNING {TASK_RETURNING_COLUMNS_ALIASED}
+                "#
+            )
+        };
+
+        let pending_sql = claim_arm_sql("status = 'pending'");
+        let row = match sqlx::query(&pending_sql)
             .bind(worker_id)
             .bind(lease_token)
             .bind(lease_expires_at)
-            .fetch_optional(&*self.pool)
+            .bind(fair_ws)
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| TaskError::StorageError(format!("Failed to claim next task: {}", e)))?;
+        {
+            Ok(row) => row,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(TaskError::StorageError(format!(
+                    "Failed to claim pending task: {e}"
+                )));
+            }
+        };
+
+        let row = if row.is_some() {
+            row
+        } else {
+            let stale_sql = claim_arm_sql(
+                "status = 'processing' AND (lease_expires_at IS NULL OR lease_expires_at < NOW())",
+            );
+            match sqlx::query(&stale_sql)
+                .bind(worker_id)
+                .bind(lease_token)
+                .bind(lease_expires_at)
+                .bind(fair_ws)
+                .fetch_optional(&mut *tx)
+                .await
+            {
+                Ok(row) => row,
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    return Err(TaskError::StorageError(format!(
+                        "Failed to claim stale processing task: {e}"
+                    )));
+                }
+            }
+        };
+
+        tx.commit().await.map_err(|e| {
+            TaskError::StorageError(format!("Failed to commit claim_next txn: {e}"))
+        })?;
 
         match row {
             Some(row) => Ok(Some(task_from_row(&row)?)),
@@ -700,15 +857,28 @@ impl TaskStorage for PostgresTaskStorage {
         tenant_id: Option<uuid::Uuid>,
         workspace_id: Option<uuid::Uuid>,
     ) -> TaskResult<QueueMetrics> {
-        // OODA-04: Add tenant/workspace filtering for multi-tenant isolation
-        //
-        // WHY: Queue metrics MUST be scoped to the current tenant/workspace.
-        // Without this filter, users see processing activity from ALL workspaces,
-        // which is a privacy violation and causes user confusion.
-        //
-        // The filter uses ($1::uuid IS NULL OR tenant_id = $1) pattern to make
-        // parameters optional - if None is passed, no filtering is applied.
-        let row = sqlx::query(
+        const METRICS_STATEMENT_TIMEOUT_MS: u32 = 500;
+
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            TaskError::StorageError(format!(
+                "Failed to acquire connection for queue metrics: {e}"
+            ))
+        })?;
+        let mut tx = conn.begin().await.map_err(|e| {
+            TaskError::StorageError(format!("Failed to begin queue metrics txn: {e}"))
+        })?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{METRICS_STATEMENT_TIMEOUT_MS}ms'"
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TaskError::StorageError(format!(
+                "Failed to set queue metrics statement_timeout: {e}"
+            ))
+        })?;
+
+        let row = match sqlx::query(
             r#"
             SELECT
                 COUNT(*) FILTER (WHERE status = 'pending') as pending_count,
@@ -728,9 +898,22 @@ impl TaskStorage for PostgresTaskStorage {
         )
         .bind(tenant_id)
         .bind(workspace_id)
-        .fetch_one(&*self.pool)
+        .fetch_one(&mut *tx)
         .await
-        .map_err(|e| TaskError::StorageError(format!("Failed to get queue metrics: {}", e)))?;
+        {
+            Ok(row) => {
+                tx.commit().await.map_err(|e| {
+                    TaskError::StorageError(format!("Failed to commit queue metrics txn: {e}"))
+                })?;
+                row
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(TaskError::StorageError(format!(
+                    "Failed to get queue metrics: {e}"
+                )));
+            }
+        };
 
         let pending_count = row.get::<i64, _>("pending_count") as u64;
         let processing_count = row.get::<i64, _>("processing_count") as u64;
@@ -738,10 +921,8 @@ impl TaskStorage for PostgresTaskStorage {
         let max_wait_time_seconds = row.get::<f64, _>("max_wait_seconds");
         let recent_completed = row.get::<i64, _>("recent_completed") as u64;
 
-        // Calculate throughput (docs per minute over last 5 minutes)
         let throughput_per_minute = recent_completed as f64 / 5.0;
 
-        // Estimate queue time
         let estimated_queue_time_seconds = if throughput_per_minute > 0.0 {
             (pending_count as f64 / throughput_per_minute) * 60.0
         } else if avg_wait_time_seconds > 0.0 {
@@ -750,8 +931,7 @@ impl TaskStorage for PostgresTaskStorage {
             0.0
         };
 
-        // Worker utilization (assuming 4 max workers)
-        let max_workers = 4u32;
+        let max_workers = task_max_workers_from_env();
         let active_workers = processing_count.min(max_workers as u64) as u32;
         let worker_utilization = ((active_workers as f64 / max_workers as f64) * 100.0) as u8;
 
@@ -765,20 +945,68 @@ impl TaskStorage for PostgresTaskStorage {
             max_wait_time_seconds,
             throughput_per_minute,
             estimated_queue_time_seconds,
-            rate_limited: false, // TODO: Track rate limiting separately
+            rate_limited: false,
             timestamp: chrono::Utc::now(),
         })
+    }
+
+    async fn prune_terminal_tasks(&self, older_than_days: u32) -> TaskResult<u64> {
+        let days = i32::try_from(older_than_days.max(1)).map_err(|_| {
+            TaskError::StorageError("older_than_days exceeds i32 range".to_string())
+        })?;
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM tasks
+            WHERE status IN ('indexed', 'failed', 'cancelled')
+              AND completed_at IS NOT NULL
+              AND completed_at < NOW() - make_interval(days => $1)
+            "#,
+        )
+        .bind(days)
+        .execute(&*self.pool)
+        .await
+        .map_err(|e| TaskError::StorageError(format!("Failed to prune terminal tasks: {e}")))?;
+
+        // SPEC-090 F-090-13: detach empty month partitions older than retention.
+        let _ = sqlx::query_scalar::<_, i32>("SELECT edgequake_detach_old_task_partitions($1)")
+            .bind(days)
+            .fetch_optional(&*self.pool)
+            .await;
+
+        Ok(result.rows_affected())
     }
 }
 
 #[cfg(feature = "postgres")]
 impl PostgresTaskStorage {
-    async fn get_total_count(&self, filter: TaskFilter) -> TaskResult<u64> {
-        let mut query = String::from("SELECT COUNT(*) FROM tasks WHERE 1=1");
+    async fn get_estimated_count(&self, filter: TaskFilter) -> TaskResult<u64> {
+        let has_filters = filter.tenant_id.is_some()
+            || filter.workspace_id.is_some()
+            || filter.status.is_some()
+            || filter.task_type.is_some();
 
+        if !has_filters {
+            let estimate: Option<i64> = sqlx::query_scalar(
+                r#"
+                SELECT GREATEST(reltuples::bigint, 0)
+                FROM pg_class
+                WHERE oid = 'public.tasks'::regclass
+                "#,
+            )
+            .fetch_optional(&*self.pool)
+            .await
+            .map_err(|e| TaskError::StorageError(format!("Failed to estimate task count: {e}")))?;
+            if let Some(n) = estimate {
+                if n >= 0 {
+                    return Ok(n as u64);
+                }
+            }
+        }
+
+        let mut query = String::from("SELECT COUNT(*) FROM tasks WHERE 1=1");
         let mut param_count = 0;
 
-        // CRITICAL: Filter by tenant_id and workspace_id for multi-tenancy isolation
         if filter.tenant_id.is_some() {
             param_count += 1;
             query.push_str(&format!(" AND tenant_id = ${}", param_count));
@@ -787,7 +1015,6 @@ impl PostgresTaskStorage {
             param_count += 1;
             query.push_str(&format!(" AND workspace_id = ${}", param_count));
         }
-
         if filter.status.is_some() {
             param_count += 1;
             query.push_str(&format!(" AND status = ${}", param_count));
@@ -797,9 +1024,23 @@ impl PostgresTaskStorage {
             query.push_str(&format!(" AND task_type = ${}", param_count));
         }
 
-        let mut query_builder = sqlx::query(&query);
+        let mut conn = self.pool.acquire().await.map_err(|e| {
+            TaskError::StorageError(format!("Failed to acquire connection for task count: {e}"))
+        })?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| TaskError::StorageError(format!("Failed to begin count txn: {e}")))?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{LIST_STATEMENT_TIMEOUT_MS}ms'"
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            TaskError::StorageError(format!("Failed to set count statement_timeout: {e}"))
+        })?;
 
-        // Bind parameters in the same order as they appear in the query
+        let mut query_builder = sqlx::query(&query);
         if let Some(tenant_id) = &filter.tenant_id {
             query_builder = query_builder.bind(tenant_id);
         }
@@ -813,10 +1054,20 @@ impl PostgresTaskStorage {
             query_builder = query_builder.bind(task_type.to_string());
         }
 
-        let row = query_builder
-            .fetch_one(&*self.pool)
-            .await
-            .map_err(|e| TaskError::StorageError(format!("Failed to count tasks: {}", e)))?;
+        let row = match query_builder.fetch_one(&mut *tx).await {
+            Ok(row) => {
+                tx.commit().await.map_err(|e| {
+                    TaskError::StorageError(format!("Failed to commit count txn: {e}"))
+                })?;
+                row
+            }
+            Err(e) => {
+                let _ = tx.rollback().await;
+                return Err(TaskError::StorageError(format!(
+                    "Failed to count tasks: {e}"
+                )));
+            }
+        };
 
         Ok(row.get::<i64, _>(0) as u64)
     }

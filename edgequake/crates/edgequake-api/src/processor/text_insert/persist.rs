@@ -90,7 +90,8 @@ impl DocumentTaskProcessor {
         }
 
         // Update task progress - extraction (chunk vectors deferred to P-G2 persist below)
-        task.update_progress("extraction".to_string(), 4, 60);
+        self.bump_task_progress(task, "extraction".to_string(), 4, 60)
+            .await;
 
         // ── CANCELLATION GATE: before graph storage (heavy DB writes) ──
         self.check_cancelled(&cancel_token, "pre-graph-storage", &document_id)
@@ -275,7 +276,8 @@ impl DocumentTaskProcessor {
         );
 
         // Update task progress - indexing complete
-        task.update_progress("indexing".to_string(), 4, 100);
+        self.bump_task_progress(task, "indexing".to_string(), 4, 100)
+            .await;
 
         // SPEC-032/OODA-198: Augment stats with provider lineage before storing
         let mut stats_with_lineage = result.stats.clone();
