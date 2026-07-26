@@ -8,10 +8,14 @@ ROOT = Path(__file__).resolve().parents[3]
 inv = json.loads((ROOT / "docs/data-layer/00-inventory.json").read_text())
 refs = {o["ref"] for o in inv}
 
-# dataop.rs constants — only ALL_REF_IDS / pub const assignments, not test fixtures
+# dataop.rs constants — only ALL_REF_IDS / pub const assignments, not test fixtures.
+# rustfmt may wrap long consts across two lines (`: &str =\n    "DATA-..."`).
 dataop = (ROOT / "edgequake/crates/edgequake-storage/src/dataop.rs").read_text()
 code_refs = set(
-    re.findall(r'pub const DATA_[A-Z0-9_]+: &str = "(DATA-(?:PG|PGVEC|AGE)-[A-Z0-9-]+)"', dataop)
+    re.findall(
+        r'pub const DATA_[A-Z0-9_]+:\s*&str\s*=\s*\n?\s*"(DATA-(?:PG|PGVEC|AGE)-[A-Z0-9-]+)"',
+        dataop,
+    )
 )
 
 # docs mention
@@ -44,7 +48,8 @@ if not ann_path.exists():
 else:
     ann_text = ann_path.read_text()
     for r in sorted(refs):
-        if f'("{r}"' not in ann_text and f'("{r}",' not in ann_text:
+        # Catalog tuples are rustfmt-wrapped: (\n        "DATA-...",\n        r###"...")
+        if f'"{r}"' not in ann_text:
             errors.append(f"Missing annotation catalog entry: {r}")
             break
 

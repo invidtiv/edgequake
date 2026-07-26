@@ -346,7 +346,7 @@ fn opaque_prefixed_or_token_uuid(s: &str) -> bool {
     // common `uuid` word already handled above; also catch `NAME_<uuid>` with
     // multi-segment prefix when the *last* token is a UUID and the rest has
     // no letters forming a long human phrase — keep conservative: only when
-    // the last token is UUID and every other token is ≤12 ASCII alnum chars.
+    // the last token is UUID and every other token is <=12 ASCII alnum chars.
     if tokens.len() >= 2 {
         if let Some(last) = tokens.last() {
             if is_uuid_shape(last) {

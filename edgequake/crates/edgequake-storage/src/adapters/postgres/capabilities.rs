@@ -33,7 +33,7 @@ pub const HNSW_MAX_DIM_HALFVEC: usize = 4000;
 pub const PGVECTOR_MIN_ITERATIVE_SCAN: &str = "0.8.0";
 
 /// CVE-safe floor (CVE-2026-3172 affected 0.8.0/0.8.1 parallel HNSW builds).
-/// Prefer image pin ≥0.8.5; readiness warns below this floor.
+/// Prefer image pin >=0.8.5; readiness warns below this floor.
 pub const PGVECTOR_MIN_CVE_SAFE: &str = "0.8.2";
 
 /// True when `extversion` meets the CVE-safe pgvector floor.

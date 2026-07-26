@@ -1,3 +1,7 @@
+---
+title: "Data-Layer Operation Inventory"
+---
+
 # Data-Layer Operation Inventory
 
 **Mission:** [specs/088-data-layer/00-mission.md](../../specs/088-data-layer/00-mission.md)

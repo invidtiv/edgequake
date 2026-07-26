@@ -1,3 +1,11 @@
+---
+title: "SPEC-088 — Data-Layer Operation Inventory & Hardening"
+---
+
+---
+title: "SPEC-088 — Data-Layer Operation Inventory & Hardening"
+---
+
 # SPEC-088 — Data-Layer Operation Inventory & Hardening
 
 Mission SSOT: [00-mission.md](./00-mission.md)

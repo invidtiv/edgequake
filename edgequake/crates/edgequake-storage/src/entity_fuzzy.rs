@@ -85,7 +85,7 @@ pub fn fuzzy_name_similarity(a: &str, b: &str) -> f64 {
 /// Find best fuzzy match among `candidates` (normalized bare names or graph ids).
 ///
 /// Candidates are filtered by [`blocking_key`] when both sides have a key.
-/// Returns the candidate string with the highest score ≥ threshold.
+/// Returns the candidate string with the highest score >= threshold.
 pub fn find_best_fuzzy_match<'a>(
     query: &str,
     candidates: impl IntoIterator<Item = &'a str>,

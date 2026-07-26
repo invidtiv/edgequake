@@ -146,20 +146,18 @@ impl VectorStorage for PgVectorStorage {
         self.upsert_report_created(data).await.map(|_| ())
     }
 
-    /**
-     * @dataop      DATA-PGVEC-VECTORS-UPSERT-BATCH-004
-     * @engine      pgvector 0.8.x (secondary: postgres)
-     * @intent      Batch upsert embeddings via UNNEST + ON CONFLICT; report newly inserted IDs.
-     * @tables      eq_{ns}_vectors
-     * @indexes     PK(id); HNSW graph insert cost on new rows
-     * @complexity  time: O(B log N) per batch B≤1000; space: O(B * D)
-     * @limits      - Batch chunk ≤1000; dim must match table; duplicate IDs last-write-wins
-     *              - HNSW insert under concurrent load may bloat; no long txn across network
-     * @scaling     Linear in B; index build separate (DDL)
-     * @tests       tests/data_layer/data_layer_limits.rs
-     * @pgversions  16: ok | 17: ok | 18: ok
-     * @docs        specs/088-data-layer/pgvector.md#data-pgvec-vectors-upsert-batch-004
-     */
+    // @dataop      DATA-PGVEC-VECTORS-UPSERT-BATCH-004
+    // @engine      pgvector 0.8.x (secondary: postgres)
+    // @intent      Batch upsert embeddings via UNNEST + ON CONFLICT; report newly inserted IDs.
+    // @tables      eq_{ns}_vectors
+    // @indexes     PK(id); HNSW graph insert cost on new rows
+    // @complexity  time: O(B log N) per batch B<=1000; space: O(B * D)
+    // @limits      - Batch chunk <=1000; dim must match table; duplicate IDs last-write-wins
+    //              - HNSW insert under concurrent load may bloat; no long txn across network
+    // @scaling     Linear in B; index build separate (DDL)
+    // @tests       tests/data_layer/data_layer_limits.rs
+    // @pgversions  16: ok | 17: ok | 18: ok
+    // @docs        specs/088-data-layer/pgvector.md#data-pgvec-vectors-upsert-batch-004
     /// SPEC-059: `RETURNING (xmax = 0) AS inserted` — atomic insert detection.
     async fn upsert_report_created(
         &self,
@@ -770,7 +768,7 @@ impl VectorStorage for PgVectorStorage {
 
         // Resolve capability BEFORE begin(): supports_iterative_scan may acquire a
         // second pool connection (OnceCell init). Doing that while holding a tx
-        // deadlocks when pool is saturated (clients ≥ max_connections).
+        // deadlocks when pool is saturated (clients >= max_connections).
         let iterative_scan = self.supports_iterative_scan().await;
 
         // QW3: metadata pre-filter present -> raise recall AND enable iterative

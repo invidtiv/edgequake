@@ -1,3 +1,7 @@
+---
+title: "Apache AGE data-layer operations (`DATA-AGE-*`)"
+---
+
 # Apache AGE data-layer operations (`DATA-AGE-*`)
 
 

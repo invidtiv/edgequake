@@ -1,3 +1,7 @@
+---
+title: "SPEC-088 Phase 5–6 — Improvements: done & proved"
+---
+
 # SPEC-088 Phase 5–6 — Improvements: done & proved
 
 **Status:** Phase 6 **complete** for recommended request-path work (2026-07-25).  

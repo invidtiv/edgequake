@@ -1,3 +1,7 @@
+---
+title: "pgvector data-layer operations (`DATA-PGVEC-*`)"
+---
+
 # pgvector data-layer operations (`DATA-PGVEC-*`)
 
 ANN search, HNSW/IVF, halfvec, search GUCs. Sources: [pgvector README](https://github.com/pgvector/pgvector) v0.8.5.

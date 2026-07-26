@@ -95,7 +95,7 @@ pub trait GraphStorageAnalyticsOps: GraphStorageReadOps + GraphScanOps {
     /// probe upper bound (SPEC-089 / GH-336 / LAW-H1).
     ///
     /// `probe_limit` is clamped by adapters to the SSOT max (256). Prefer
-    /// `max(chunk_count)` on the visible page so probes stay `≤ page × chunks`
+    /// `max(chunk_count)` on the visible page so probes stay `<= page × chunks`
     /// instead of `corpus × 256`.
     async fn node_counts_by_source_prefixes_capped(
         &self,

@@ -1,3 +1,7 @@
+---
+title: "Index catalog"
+---
+
 # Index catalog
 
 Bidirectional: each index lists consuming Ref IDs; each op lists indexes in engine docs.

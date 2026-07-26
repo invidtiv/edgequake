@@ -1,3 +1,7 @@
+---
+title: "Postgres data-layer operations (`DATA-PG-*`)"
+---
+
 # Postgres data-layer operations (`DATA-PG-*`)
 
 Plain SQL / JSONB / tasks / tenancy / auth. Secondary engine notes appear on hybrid ops.

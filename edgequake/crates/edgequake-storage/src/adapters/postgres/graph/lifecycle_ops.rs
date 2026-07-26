@@ -23,7 +23,7 @@ impl PostgresAGEGraphStorage {
         self.ensure_indexes().await?;
 
         // SPEC-032 W-01: Bootstrap critical btree indexes CONCURRENTLY for
-        // existing databases. For graphs with ≥10K nodes, this runs
+        // existing databases. For graphs with >=10K nodes, this runs
         // CREATE INDEX CONCURRENTLY (non-blocking). For empty/new graphs,
         // a regular CREATE INDEX is used (fast).
         // Edge cases: AGE not installed, graph not yet created, INVALID index → all handled.

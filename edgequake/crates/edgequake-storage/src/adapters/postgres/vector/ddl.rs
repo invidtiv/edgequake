@@ -524,7 +524,7 @@ impl PgVectorStorage {
     }
 
     /// SPEC-065: productized Wave-2 path — create partial HNSW for a hot workspace
-    /// when opt-in is on, table is shared (multi-WS), and row count ≥ threshold.
+    /// when opt-in is on, table is shared (multi-WS), and row count >= threshold.
     ///
     /// Dedicated per-workspace tables are a no-op (already isolated by table).
     /// Mutual exclusivity: shared tables use partial OR global HNSW per workspace —

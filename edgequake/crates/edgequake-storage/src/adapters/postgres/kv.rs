@@ -323,7 +323,7 @@ impl KVStorage for PostgresKVStorage {
      * @intent      Atomic batch upsert of JSONB values (UNNEST + ON CONFLICT).
      * @tables      eq_{ns}_kv
      * @indexes     PRIMARY KEY (key)
-     * @complexity  time: O(B log N) per chunk B≤1000; space: O(B)
+     * @complexity  time: O(B log N) per chunk B<=1000; space: O(B)
      * @limits      - Chunk size 1000; multi-workspace keys rejected (fail-closed)
      *              - Single transaction for full batch
      * @scaling     Linear in total keys

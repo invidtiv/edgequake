@@ -99,7 +99,7 @@ impl PostgresAGEGraphStorage {
      * @tables      {graph}."Node"
      * @indexes     UNIQUE expression on properties->>'node_id'
      * @complexity  time: O(K log N) native; Cypher MERGE higher latency
-     * @limits      - Adaptive Cypher UNWIND body ≤512KB; chunk dedupe by node_id
+     * @limits      - Adaptive Cypher UNWIND body <=512KB; chunk dedupe by node_id
      *              - Cypher path debug-only when native disabled
      * @scaling     Linear in K; prefer native
      * @tests       tests/data_layer/data_layer_limits.rs
@@ -140,7 +140,7 @@ impl PostgresAGEGraphStorage {
             "native graph writes disabled — using Cypher MERGE (set EDGEQUAKE_NATIVE_GRAPH_WRITES=1 for O(K log N) ON CONFLICT)"
         );
 
-        // SPEC-032 W-05: Adaptive chunk size — keep UNWIND body ≤ 512 KB.
+        // SPEC-032 W-05: Adaptive chunk size — keep UNWIND body <= 512 KB.
         let chunk_size = Self::adaptive_unwind_chunk_size(nodes);
 
         for chunk in nodes.chunks(chunk_size) {

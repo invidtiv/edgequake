@@ -70,7 +70,7 @@ pub(in crate::adapters::postgres) fn graph_query_statement_timeout_ms() -> u32 {
 /// Interactive HTTP read-path PG kill (SPEC-089 Phase 4 / F-336-13).
 ///
 /// Mirrors `EDGEQUAKE_DOCUMENTS_READ_TIMEOUT_MS` (default 2500) minus headroom.
-/// Worker wall-clock (≤7200s) is LLM-bound — per-statement kills stay on
+/// Worker wall-clock (<=7200s) is LLM-bound — per-statement kills stay on
 /// `LocalTimeoutTx` / AGE session GUCs, not this interactive budget.
 pub fn interactive_statement_timeout_ms() -> u32 {
     let ms = std::env::var("EDGEQUAKE_DOCUMENTS_READ_TIMEOUT_MS")

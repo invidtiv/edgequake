@@ -1,3 +1,7 @@
+---
+title: "Version matrix (PG16 / PG17 / PG18)"
+---
+
 # Version matrix (PG16 / PG17 / PG18)
 
 Default status after Phase 0–4 inventory: **pending live EXPLAIN capture** unless covered by existing e2e_spec061 matrix.
